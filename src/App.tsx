@@ -35,7 +35,6 @@ import {
   Play,
   Share2,
   Check,
-  Radio,
   LogIn,
   LogOut,
   Sparkles,
@@ -295,6 +294,19 @@ export default function App() {
 
         {/* Center/Right controls: Dropdown toggle, Fullscreen, Sound */}
         <div className="flex items-center gap-2 relative">
+
+          <button
+            onClick={() => {
+              setIsMultiplayerOpen(true);
+              setIsMenuOpen(false);
+            }}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl border border-cyan-500/40 bg-cyan-500/10 text-cyan-200 hover:bg-cyan-500/20 transition text-xs font-semibold"
+            title="Play with another player"
+          >
+            <Users className="w-4 h-4" />
+            <span className="hidden sm:inline">2 Player</span>
+            <span className="sm:hidden">2P</span>
+          </button>
           
           {/* Settings / Controls Dropdown Button */}
           <div className="relative">
@@ -354,7 +366,7 @@ export default function App() {
                  {/* Game Mode */}
                 <div className="flex flex-col gap-1">
                   <span className="text-slate-300 font-medium">Game Mode:</span>
-                  <div className="grid grid-cols-2 gap-1.5">
+                  <div className="grid grid-cols-1 gap-1.5">
                     <button
                       onClick={() => { setMode('bot'); setIsMenuOpen(false); }}
                       className={`flex items-center justify-center gap-1.5 py-1.5 rounded-lg font-medium transition text-xs ${
@@ -365,13 +377,6 @@ export default function App() {
                     >
                       <Bot className="w-4 h-4" />
                       <span>vs Bot</span>
-                    </button>
-                    <button
-                      onClick={() => { setIsMultiplayerOpen(true); setIsMenuOpen(false); }}
-                      className="flex items-center justify-center gap-1.5 py-1.5 rounded-lg bg-slate-950 text-slate-300 border border-slate-800 hover:bg-slate-800 font-medium text-xs"
-                    >
-                      <Radio className="w-4 h-4 text-cyan-400" />
-                      <span>Online PvP</span>
                     </button>
                   </div>
                 </div>

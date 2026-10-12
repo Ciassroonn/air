@@ -195,6 +195,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   const [isServing, setIsServing] = useState(true);
   const [isPuckInHitRange, setIsPuckInHitRange] = useState(false);
   const [isPowerShotArmed, setIsPowerShotArmed] = useState(false);
+  const [powerShotCooldownDisplay, setPowerShotCooldownDisplay] = useState(0);
   const [selectedServeX, setSelectedServeX] = useState(0);
   const [countdownText, setCountdownText] = useState<number | 'GO' | null>(null);
   const [isPointerLocked, setIsPointerLocked] = useState(false);
@@ -206,6 +207,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     // Power shot state
     p1PowerShotArmed: false,
     p1PowerShotCooldown: 0,
+    lastPowerShotCooldownDisplay: 0,
     p2PowerShotArmed: false,
 
     // Table dimensions
@@ -434,12 +436,18 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         typeof packet.vx === 'number' &&
         typeof packet.vz === 'number'
       ) {
-        s.p2X = packet.x;
-        s.p2Z = -packet.z;
-        s.p2Vx = Math.max(-30, Math.min(30, packet.vx));
-        s.p2Vz = Math.max(-30, Math.min(30, -packet.vz));
-        if (typeof packet.powerShotArmed === 'boolean') {
-          s.p2PowerShotArmed = packet.powerShotArmed;
+        if (!s.isGoalCountdown) {
+          s.p2X = packet.x;
+          s.p2Z = -packet.z;
+          s.p2Vx = Math.max(-30, Math.min(30, packet.vx));
+          s.p2Vz = Math.max(-30, Math.min(30, -packet.vz));
+          if (typeof packet.powerShotArmed === 'boolean') {
+            s.p2PowerShotArmed = packet.powerShotArmed;
+          }
+        } else {
+          s.p2Vx = 0;
+          s.p2Vz = 0;
+          s.p2PowerShotArmed = false;
         }
         s.lastRemotePaddleUpdateTime = performance.now();
       } else if (
@@ -644,6 +652,8 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     s.player2ResetRequested = false;
     s.p1PowerShotArmed = false;
     s.p1PowerShotCooldown = 0;
+    s.lastPowerShotCooldownDisplay = 0;
+    setPowerShotCooldownDisplay(0);
     s.p2PowerShotArmed = false;
     setIsPowerShotArmed(false);
     setResetRequestStatus('');
@@ -1308,7 +1318,6 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         event.target !== canvas ||
         document.pointerLockElement === canvas
       ) return;
-      const rect = container.getBoundingClientRect();
       try {
         void canvas.requestPointerLock();
       } catch (error) {
@@ -1356,6 +1365,11 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       lastTime = time;
 
       s.p1PowerShotCooldown = Math.max(0, s.p1PowerShotCooldown - dt);
+      const cooldownDisplay = Math.ceil(s.p1PowerShotCooldown);
+      if (cooldownDisplay !== s.lastPowerShotCooldownDisplay) {
+        s.lastPowerShotCooldownDisplay = cooldownDisplay;
+        setPowerShotCooldownDisplay(cooldownDisplay);
+      }
 
       const currentMode = propsRef.current.mode;
       const currentDifficulty = propsRef.current.botDifficulty;
@@ -2394,26 +2408,33 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 
       {/* Controls HUD Hint */}
       <div className="absolute bottom-3 left-4 z-20 flex items-center gap-3 text-xs text-slate-400/80 font-mono">
+        <span className="px-2 py-1 rounded bg-slate-900/80 border border-slate-800 pointer-events-none">
+          Fake cursor tracks puck
+        </span>
         <span className="hidden sm:inline px-2 py-1 rounded bg-slate-900/80 border border-slate-800 pointer-events-none">
-          Fake cursor tracks puck · Click table to lock mouse · Esc to release
+          Click table to lock mouse · Esc to release
         </span>
         <button
           type="button"
           onClick={() => {
             const s = stateRef.current;
-            if (!s.p1PowerShotArmed && s.p1PowerShotCooldown <= 0) {
+            if (!s.isGoalCountdown && !s.p1PowerShotArmed && s.p1PowerShotCooldown <= 0) {
               s.p1PowerShotArmed = true;
               setIsPowerShotArmed(true);
             }
           }}
-          disabled={isPowerShotArmed}
+          disabled={isPowerShotArmed || powerShotCooldownDisplay > 0 || stateRef.current.isGoalCountdown}
           className={`pointer-events-auto px-2.5 py-1 rounded border transition-colors select-none ${
             isPowerShotArmed
               ? 'bg-amber-500/20 text-amber-300 border-amber-500/60 font-semibold shadow-[0_0_12px_rgba(245,158,11,0.3)] animate-pulse'
               : 'bg-slate-900/80 border-slate-800 text-slate-400/80 hover:bg-slate-800 hover:text-slate-200'
           }`}
         >
-          {isPowerShotArmed ? 'POWER SHOT ARMED — HIT THE PUCK' : 'SHIFT: POWER SHOT'}
+          {isPowerShotArmed
+            ? 'POWER SHOT ARMED — HIT THE PUCK'
+            : powerShotCooldownDisplay > 0
+              ? `POWER SHOT READY IN ${powerShotCooldownDisplay}s`
+              : 'SHIFT: POWER SHOT — READY'}
         </button>
       </div>
 
