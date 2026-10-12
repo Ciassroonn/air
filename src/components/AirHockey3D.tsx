@@ -1359,10 +1359,10 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
           s.p2Vz = 0;
         } else {
           const botConfig: Record<BotDifficulty, { speed: number; strikeBoost: number; predictDepth: number; aimSkill: number }> = {
-            rookie: { speed: 6.5,  strikeBoost: 1.05, predictDepth: 0.30, aimSkill: 0.20 },
-            normal: { speed: 9.5,  strikeBoost: 1.18, predictDepth: 0.60, aimSkill: 0.40 },
-            pro:    { speed: 21,   strikeBoost: 1.85, predictDepth: 1.55, aimSkill: 0.88 },
-            god:    { speed: 39.5, strikeBoost: 2.75, predictDepth: 2.30, aimSkill: 1.00 }
+            rookie: { speed: 4.5,  strikeBoost: 0.95, predictDepth: 0.20, aimSkill: 0.12 },
+            normal: { speed: 6.5,  strikeBoost: 1.05, predictDepth: 0.40, aimSkill: 0.30 },
+            pro:    { speed: 14,   strikeBoost: 1.4,  predictDepth: 1.0,  aimSkill: 0.72 },
+            god:    { speed: 26,   strikeBoost: 2.0,  predictDepth: 1.6,  aimSkill: 0.90 }
           };
           const activeBot = botConfig[currentDifficulty] || botConfig.normal;
 
@@ -2040,7 +2040,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       }
 
       // Exchange only the latest inputs and authoritative puck state over WebRTC.
-      if (currentMode === 'online_host' && time - s.lastSyncTime > 30) {
+      if (currentMode === 'online_host' && time - s.lastSyncTime > 16) {
         s.lastSyncTime = time;
         sendPeerPacket(propsRef.current.gameDataChannel, {
           type: 'host-state',
@@ -2135,7 +2135,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     }
   };
   useEffect(() => {
-    stateRef.current.p1MalletRadius = mode === 'bot' && helpDisabled
+    stateRef.current.p1MalletRadius = mode === 'online_host' || mode === 'online_guest' || (mode === 'bot' && helpDisabled)
       ? stateRef.current.p2MalletRadius
       : 1.4;
   }, [mode, helpDisabled]);
@@ -2143,7 +2143,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full select-none overflow-hidden bg-slate-950 cursor-crosshair"
+      className="relative w-full h-full select-none overflow-hidden bg-slate-950 cursor-none"
     >
       <canvas ref={canvasRef} className="block w-full h-full" />
 

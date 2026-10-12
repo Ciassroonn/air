@@ -58,8 +58,8 @@ export default function App() {
   const [winningScore, setWinningScore] = useState(10);
   const [allowOwnGoals, setAllowOwnGoals] = useState(true);
   const [helpDisabled, setHelpDisabled] = useState(false);
-  const [puckSpeedMultiplier, setPuckSpeedMultiplier] = useState(1);
-  const [puckFriction, setPuckFriction] = useState(0.08);
+  const [puckSpeedMultiplier, setPuckSpeedMultiplier] = useState(0.5);
+  const [puckFriction, setPuckFriction] = useState(0.16);
   const [gameAnnouncement, setGameAnnouncement] = useState('');
   const [playerScore, setPlayerScore] = useState(0);
   const [opponentScore, setOpponentScore] = useState(0);
