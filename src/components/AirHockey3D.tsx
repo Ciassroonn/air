@@ -187,6 +187,8 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const cursorRef = useRef<HTMLDivElement>(null);
+  const cursorPositionRef = useRef({ x: 0, y: 0 });
 
   // Score states
   const [playerScore, setPlayerScore] = useState(0);
@@ -196,6 +198,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   const [isPowerShotArmed, setIsPowerShotArmed] = useState(false);
   const [selectedServeX, setSelectedServeX] = useState(0);
   const [countdownText, setCountdownText] = useState<number | 'GO' | null>(null);
+  const [isPointerLocked, setIsPointerLocked] = useState(false);
   const [resetRequestStatus, setResetRequestStatus] = useState('');
   const [winner, setWinner] = useState<'player' | 'opponent' | null>(null);
 
@@ -1210,10 +1213,16 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const sens = propsRef.current.mouseSensitivityMultiplier || 2.5;
 
       if (!('touches' in e) && document.pointerLockElement === canvas) {
+        const mouseEvent = e as MouseEvent;
+        cursorPositionRef.current.x = Math.max(0, Math.min(rect.width, cursorPositionRef.current.x + mouseEvent.movementX));
+        cursorPositionRef.current.y = Math.max(0, Math.min(rect.height, cursorPositionRef.current.y + mouseEvent.movementY));
+        if (cursorRef.current) {
+          cursorRef.current.style.transform = `translate(${cursorPositionRef.current.x}px, ${cursorPositionRef.current.y}px)`;
+        }
         const viewHeight = Math.max(34, 34 / (rect.width / rect.height));
         const moveScale = viewHeight / rect.height * (sens / 2.5);
-        s.targetP1X += (e as MouseEvent).movementX * moveScale;
-        s.targetP1Z += (e as MouseEvent).movementY * moveScale;
+        s.targetP1X += mouseEvent.movementX * moveScale;
+        s.targetP1Z += mouseEvent.movementY * moveScale;
         s.targetP1X = Math.max(-p1ClampW, Math.min(p1ClampW, s.targetP1X));
         s.targetP1Z = Math.max(0.6, Math.min(p1ClampL, s.targetP1Z));
         return;
@@ -1282,6 +1291,14 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         event.target !== canvas ||
         document.pointerLockElement === canvas
       ) return;
+      const rect = container.getBoundingClientRect();
+      cursorPositionRef.current = {
+        x: Math.max(0, Math.min(rect.width, event.clientX - rect.left)),
+        y: Math.max(0, Math.min(rect.height, event.clientY - rect.top))
+      };
+      if (cursorRef.current) {
+        cursorRef.current.style.transform = `translate(${cursorPositionRef.current.x}px, ${cursorPositionRef.current.y}px)`;
+      }
       try {
         void canvas.requestPointerLock();
       } catch (error) {
@@ -1291,6 +1308,9 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     const handlePointerLockError = () => {
       console.error('The browser could not lock the game pointer.');
     };
+    const handlePointerLockChange = () => {
+      setIsPointerLocked(document.pointerLockElement === canvas);
+    };
 
     window.addEventListener('mousemove', handlePointerMove);
     window.addEventListener('touchmove', handlePointerMove, { passive: true });
@@ -1298,6 +1318,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     window.addEventListener('keyup', handleKeyUp);
     canvas.addEventListener('pointerdown', handlePointerDown);
     document.addEventListener('pointerlockerror', handlePointerLockError);
+    document.addEventListener('pointerlockchange', handlePointerLockChange);
 
     return () => {
       window.removeEventListener('mousemove', handlePointerMove);
@@ -1306,6 +1327,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       window.removeEventListener('keyup', handleKeyUp);
       canvas.removeEventListener('pointerdown', handlePointerDown);
       document.removeEventListener('pointerlockerror', handlePointerLockError);
+      document.removeEventListener('pointerlockchange', handlePointerLockChange);
       if (document.pointerLockElement === canvas) document.exitPointerLock();
     };
   }, []);
@@ -2217,9 +2239,21 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   return (
     <div
       ref={containerRef}
-      className="relative w-full h-full select-none overflow-hidden bg-slate-950 cursor-none"
+      className={`relative w-full h-full select-none overflow-hidden bg-slate-950 ${isPointerLocked ? 'cursor-none' : 'cursor-crosshair'}`}
     >
       <canvas ref={canvasRef} className="block w-full h-full" />
+      {isPointerLocked && (
+        <div
+          ref={cursorRef}
+          aria-hidden="true"
+          className="pointer-events-none absolute left-0 top-0 z-50 -ml-px -mt-px drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]"
+          style={{ transform: `translate(${cursorPositionRef.current.x}px, ${cursorPositionRef.current.y}px)` }}
+        >
+          <svg width="18" height="22" viewBox="0 0 18 22" fill="none">
+            <path d="M1 1V17L5.5 13L9 20L12 18.5L8.5 11.5L14 11L1 1Z" fill="white" stroke="#111827" strokeWidth="1.5" strokeLinejoin="round" />
+          </svg>
+        </div>
+      )}
 
       {!winner && !isServing && !stateRef.current.servePending && (
         <div className="absolute top-3 left-3 z-20 max-w-[calc(100%-1.5rem)] rounded-md border border-slate-700 bg-slate-900/95 p-2 shadow-lg">
