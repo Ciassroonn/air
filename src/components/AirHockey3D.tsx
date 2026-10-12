@@ -188,6 +188,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cursorRef = useRef<HTMLDivElement>(null);
+  const cursorPositionRef = useRef({ x: 0, y: 0 });
 
   // Score states
   const [playerScore, setPlayerScore] = useState(0);
@@ -1330,6 +1331,33 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     const handlePointerLockChange = () => {
       setIsPointerLocked(document.pointerLockElement === canvas);
     };
+    const handleLockedClick = (event: MouseEvent) => {
+      if (document.pointerLockElement !== canvas || event.button !== 0) return;
+      const cursorPosition = cursorPositionRef.current;
+      const bounds = container.getBoundingClientRect();
+      const target = document.elementFromPoint(
+        bounds.left + cursorPosition.x,
+        bounds.top + cursorPosition.y
+      );
+      if (!(target instanceof HTMLElement)) return;
+
+      const control = target.closest<HTMLElement>(
+        'button, a, input, select, textarea, [role="button"], [tabindex]:not([tabindex="-1"])'
+      );
+      if (!control || !container.contains(control)) return;
+
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      if (control instanceof HTMLInputElement && control.type !== 'button' && control.type !== 'checkbox') {
+        document.exitPointerLock();
+        control.focus();
+      } else if (control instanceof HTMLSelectElement || control instanceof HTMLTextAreaElement) {
+        document.exitPointerLock();
+        control.focus();
+      } else {
+        control.click();
+      }
+    };
 
     window.addEventListener('mousemove', handlePointerMove);
     window.addEventListener('touchmove', handlePointerMove, { passive: true });
@@ -1338,6 +1366,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     canvas.addEventListener('pointerdown', handlePointerDown);
     document.addEventListener('pointerlockerror', handlePointerLockError);
     document.addEventListener('pointerlockchange', handlePointerLockChange);
+    document.addEventListener('mousedown', handleLockedClick, true);
 
     return () => {
       window.removeEventListener('mousemove', handlePointerMove);
@@ -1347,6 +1376,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       canvas.removeEventListener('pointerdown', handlePointerDown);
       document.removeEventListener('pointerlockerror', handlePointerLockError);
       document.removeEventListener('pointerlockchange', handlePointerLockChange);
+      document.removeEventListener('mousedown', handleLockedClick, true);
       if (document.pointerLockElement === canvas) document.exitPointerLock();
     };
   }, []);
@@ -2172,6 +2202,8 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
           const projectedMallet = s.p1Mesh.position.clone().project(s.camera);
           const cursorX = (projectedMallet.x * 0.5 + 0.5) * container.clientWidth;
           const cursorY = (-projectedMallet.y * 0.5 + 0.5) * container.clientHeight;
+          cursorPositionRef.current.x = cursorX;
+          cursorPositionRef.current.y = cursorY;
           cursorRef.current.style.transform = `translate(${cursorX}px, ${cursorY}px)`;
           cursorRef.current.style.display =
             projectedMallet.z >= -1 && projectedMallet.z <= 1 ? '' : 'none';
