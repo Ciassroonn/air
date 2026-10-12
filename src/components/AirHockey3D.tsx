@@ -195,6 +195,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   const [isPuckInHitRange, setIsPuckInHitRange] = useState(false);
   const [isPowerShotArmed, setIsPowerShotArmed] = useState(false);
   const [selectedServeX, setSelectedServeX] = useState(0);
+  const [countdownText, setCountdownText] = useState<number | 'GO' | null>(null);
   const [resetRequestStatus, setResetRequestStatus] = useState('');
   const [winner, setWinner] = useState<'player' | 'opponent' | null>(null);
 
@@ -261,6 +262,8 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     servingWait: 1.2,
     servePending: true,
     serveDeadline: 0,
+    isGoalCountdown: false,
+    goDisplayUntil: 0,
     selectedServeX: 0,
     serveSide: 'p1' as 'p1' | 'p2',
     requestedServeX: null as number | null,
@@ -477,7 +480,17 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         s.p2Z = -(packet.hostPaddleZ as number);
         s.p1Score = packet.guestScore as number;
         s.p2Score = packet.hostScore as number;
+        const wasGoalCountdown = s.isGoalCountdown;
         s.servePending = packet.servePending as boolean;
+        s.isGoalCountdown = packet.goalCountdown === true;
+        if (s.isGoalCountdown && typeof packet.serveCountdownMs === 'number') {
+          setCountdownText(Math.max(1, Math.ceil(packet.serveCountdownMs / 1000)));
+        } else if (wasGoalCountdown && !s.isGoalCountdown) {
+          s.goDisplayUntil = performance.now() + 450;
+          setCountdownText('GO');
+        } else if (!s.isGoalCountdown && s.goDisplayUntil <= performance.now()) {
+          setCountdownText(null);
+        }
         s.serveSide = packet.serveSide as 'p1' | 'p2';
         if (typeof packet.puckResetVersion === 'number') {
           if (
@@ -582,12 +595,16 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     s.puckRailRecoveryTime = 0;
     s.servePending = false;
     s.serveDeadline = 0;
+    const completedGoalCountdown = s.isGoalCountdown;
+    s.isGoalCountdown = false;
+    s.goDisplayUntil = completedGoalCountdown ? performance.now() + 450 : 0;
     s.serveSide = server;
     s.requestedServeX = null;
     s.isScoring = false;
     s.servingWait = 0;
     s.botServeReadyAt = 0;
     setIsServing(true);
+    setCountdownText(completedGoalCountdown ? 'GO' : null);
     announce('SERVE!');
     sound.playWhistle();
 
@@ -630,6 +647,9 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     setResetRequestStatus('');
     s.servePending = true;
     s.serveDeadline = performance.now() + 2000;
+    s.isGoalCountdown = false;
+    s.goDisplayUntil = 0;
+    setCountdownText(null);
     s.selectedServeX = 0;
     s.serveSide = 'p1';
     s.requestedServeX = null;
@@ -867,7 +887,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     const endSegmentWidth = (s.tableWidth - s.goalWidth) / 2;
 
     const createEndRail = (zPos: number, isP1: boolean) => {
-      const trimMat = isP1 ? neonCyanMat : neonPinkMat;
+      const trimMat = neonPinkMat;
 
       // Left segment
       const segLeftGeo = new THREE.BoxGeometry(endSegmentWidth, railHeight, railThickness);
@@ -930,10 +950,14 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const frameZ = zPos;
 
       // Top of the goal: Radiant Neon Crossbar Header
-      const goalNeonColor = isP1 ? 0x00f0ff : 0xff1744;
-      const goalAccentNeon = isP1 ? 0x67e8f9 : 0xff5277;
-      const crossbarNeonMat = new THREE.MeshBasicMaterial({
-        color: goalNeonColor
+      const goalNeonColor = 0xc4123d;
+      const goalAccentNeon = 0xf43f64;
+      const crossbarNeonMat = new THREE.MeshStandardMaterial({
+        color: 0x741027,
+        roughness: 0.34,
+        metalness: 0.42,
+        emissive: 0x31000d,
+        emissiveIntensity: 0.45
       });
       const crossbar = new THREE.Mesh(
         new THREE.BoxGeometry(frameWidth, crossbarHeight, frameDepth),
@@ -952,7 +976,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const neonTubeGeo = new THREE.CylinderGeometry(0.1, 0.1, frameWidth + 0.2, 16);
       const neonTubeMesh = new THREE.Mesh(
         neonTubeGeo,
-        new THREE.MeshBasicMaterial({ color: goalNeonColor })
+        new THREE.MeshBasicMaterial({ color: goalAccentNeon })
       );
       neonTubeMesh.rotation.z = Math.PI / 2;
       neonTubeMesh.position.set(0, crossbarY + crossbarHeight / 2 + 0.18, frameZ);
@@ -965,7 +989,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         new THREE.MeshBasicMaterial({
           color: goalNeonColor,
           transparent: true,
-          opacity: 0.45
+          opacity: 0.2
         })
       );
       neonHaloMesh.rotation.z = Math.PI / 2;
@@ -973,7 +997,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       scene.add(neonHaloMesh);
 
       // Localized neon point light illuminating the goal entrance
-      const topGoalLight = new THREE.PointLight(goalNeonColor, 3.8, 9);
+      const topGoalLight = new THREE.PointLight(goalNeonColor, 1.8, 7);
       topGoalLight.position.set(0, crossbarY + 0.45, frameZ);
       scene.add(topGoalLight);
 
@@ -1098,11 +1122,11 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     // 7. 3D Puck
     const puckGeo = new THREE.CylinderGeometry(s.puckRadius, s.puckRadius, 0.24, 32);
     const puckMat = new THREE.MeshStandardMaterial({
-      color: 0xff6a24,
-      roughness: 0.12,
-      metalness: 0.55,
-      emissive: 0xff3b12,
-      emissiveIntensity: 2.2
+      color: 0x3b0712,
+      roughness: 0.22,
+      metalness: 0.72,
+      emissive: 0x9f102c,
+      emissiveIntensity: 1.4
     });
     const puckMesh = new THREE.Mesh(puckGeo, puckMat);
     puckMesh.position.set(0, 0.12, 0);
@@ -1112,17 +1136,17 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 
     // Puck glowing center core
     const puckCoreGeo = new THREE.CylinderGeometry(s.puckRadius * 0.55, s.puckRadius * 0.55, 0.26, 24);
-    const puckCoreMat = new THREE.MeshBasicMaterial({ color: 0xfff0c2 });
+    const puckCoreMat = new THREE.MeshBasicMaterial({ color: 0xff6178 });
     const puckCore = new THREE.Mesh(puckCoreGeo, puckCoreMat);
     puckMesh.add(puckCore);
     const puckHalo = new THREE.Mesh(
       new THREE.TorusGeometry(s.puckRadius * 0.9, 0.075, 8, 40),
-      new THREE.MeshBasicMaterial({ color: 0x29f4ff, transparent: true, opacity: 0.98 })
+      new THREE.MeshBasicMaterial({ color: 0xff244d, transparent: true, opacity: 0.9 })
     );
     puckHalo.rotation.x = Math.PI / 2;
     puckHalo.position.y = 0.16;
     puckMesh.add(puckHalo);
-    const puckLight = new THREE.PointLight(0xff4dff, 2.4, 6);
+    const puckLight = new THREE.PointLight(0xff1744, 2.4, 6);
     puckLight.position.y = 0.35;
     puckMesh.add(puckLight);
 
@@ -1152,6 +1176,9 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     s.isScoring = false;
     s.servePending = true;
     s.serveDeadline = performance.now() + 2000;
+    s.isGoalCountdown = false;
+    s.goDisplayUntil = 0;
+    setCountdownText(null);
     s.selectedServeX = 0;
     s.serveSide = 'p1';
     s.requestedServeX = null;
@@ -1169,7 +1196,8 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   // Input listeners (Mouse, Touch, Keyboard)
   useEffect(() => {
     const container = containerRef.current;
-    if (!container) return;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
 
     const s = stateRef.current;
 
@@ -1180,6 +1208,16 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const p1ClampW = halfW - s.p1MalletRadius - 0.2;
       const p1ClampL = halfL - s.p1MalletRadius - 0.2;
       const sens = propsRef.current.mouseSensitivityMultiplier || 2.5;
+
+      if (!('touches' in e) && document.pointerLockElement === canvas) {
+        const viewHeight = Math.max(34, 34 / (rect.width / rect.height));
+        const moveScale = viewHeight / rect.height * (sens / 2.5);
+        s.targetP1X += (e as MouseEvent).movementX * moveScale;
+        s.targetP1Z += (e as MouseEvent).movementY * moveScale;
+        s.targetP1X = Math.max(-p1ClampW, Math.min(p1ClampW, s.targetP1X));
+        s.targetP1Z = Math.max(0.6, Math.min(p1ClampL, s.targetP1Z));
+        return;
+      }
 
       if ('touches' in e) {
         for (let i = 0; i < e.touches.length; i++) {
@@ -1237,20 +1275,42 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       s.keys[e.key.toLowerCase()] = false;
     };
 
+    const handlePointerDown = (event: PointerEvent) => {
+      if (
+        event.pointerType !== 'mouse' ||
+        event.button !== 0 ||
+        event.target !== canvas ||
+        document.pointerLockElement === canvas
+      ) return;
+      try {
+        void canvas.requestPointerLock();
+      } catch (error) {
+        console.error('Could not lock the game pointer:', error);
+      }
+    };
+    const handlePointerLockError = () => {
+      console.error('The browser could not lock the game pointer.');
+    };
+
     window.addEventListener('mousemove', handlePointerMove);
     window.addEventListener('touchmove', handlePointerMove, { passive: true });
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    canvas.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('pointerlockerror', handlePointerLockError);
 
     return () => {
       window.removeEventListener('mousemove', handlePointerMove);
       window.removeEventListener('touchmove', handlePointerMove);
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      canvas.removeEventListener('pointerdown', handlePointerDown);
+      document.removeEventListener('pointerlockerror', handlePointerLockError);
+      if (document.pointerLockElement === canvas) document.exitPointerLock();
     };
   }, []);
 
-  // Main 60FPS Physics & Render Loop
+  // Main physics and render loop
   useEffect(() => {
     const s = stateRef.current;
 
@@ -1267,6 +1327,13 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 
       const currentMode = propsRef.current.mode;
       const currentDifficulty = propsRef.current.botDifficulty;
+      if (s.isGoalCountdown && currentMode !== 'online_guest') {
+        setCountdownText(Math.max(1, Math.ceil((s.serveDeadline - time) / 1000)));
+      }
+      if (s.goDisplayUntil > 0 && time >= s.goDisplayUntil) {
+        s.goDisplayUntil = 0;
+        setCountdownText(null);
+      }
       const speedRatio = propsRef.current.puckSpeedMultiplier / s.appliedPuckSpeedMultiplier;
       if (speedRatio !== 1) {
         s.puckVx *= speedRatio;
@@ -1282,7 +1349,8 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         currentMode === 'online_host' &&
         s.servePending &&
         s.serveSide === 'p2' &&
-        s.requestedServeX !== null
+        s.requestedServeX !== null &&
+        !s.isGoalCountdown
       ) {
         servePuck('p2', s.requestedServeX);
       }
@@ -1928,7 +1996,10 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 
         const nextServer = scorer === 'player' ? 'p2' : 'p1';
         s.servePending = true;
-        s.serveDeadline = performance.now() + 2000;
+        s.serveDeadline = performance.now() + 3000;
+        s.isGoalCountdown = true;
+        s.goDisplayUntil = 0;
+        setCountdownText(3);
         s.selectedServeX = 0;
         s.serveSide = nextServer;
         s.requestedServeX = null;
@@ -1938,9 +2009,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         s.puckVz = 0;
         s.puckRailRecoveryTime = 0;
         s.botGracePeriodUntil = performance.now() + 1800;
-        s.botServeReadyAt = currentMode === 'bot' && nextServer === 'p2'
-          ? performance.now() + 2000
-          : 0;
+        s.botServeReadyAt = 0;
         setIsServing(true);
         setSelectedServeX(0);
         announce(nextServer === 'p1' ? 'YOUR SERVE' : 'OPPONENT SERVE');
@@ -1948,6 +2017,9 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         if (newP1 >= propsRef.current.winningScore || newP2 >= propsRef.current.winningScore) {
           s.gameOver = true;
           s.servePending = false;
+          s.isGoalCountdown = false;
+          s.goDisplayUntil = 0;
+          setCountdownText(null);
           setIsServing(false);
           const matchWinner = newP1 >= propsRef.current.winningScore ? 'player' : 'opponent';
           setWinner(matchWinner);
@@ -2040,7 +2112,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       }
 
       // Exchange only the latest inputs and authoritative puck state over WebRTC.
-      if (currentMode === 'online_host' && time - s.lastSyncTime > 16) {
+      if (currentMode === 'online_host' && time - s.lastSyncTime >= 1000 / 120) {
         s.lastSyncTime = time;
         sendPeerPacket(propsRef.current.gameDataChannel, {
           type: 'host-state',
@@ -2055,12 +2127,14 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
           gameOver: s.gameOver,
           servePending: s.servePending,
           serveSide: s.serveSide,
+          goalCountdown: s.isGoalCountdown,
+          serveCountdownMs: s.isGoalCountdown ? Math.max(0, s.serveDeadline - time) : 0,
           puckSpeedMultiplier: propsRef.current.puckSpeedMultiplier,
           puckFriction: propsRef.current.puckFriction,
           resetVotes: Number(s.hostResetRequested) + Number(s.guestResetRequested),
           puckResetVersion: s.puckResetVersion
         });
-      } else if (currentMode === 'online_guest' && time - s.lastSyncTime > 16) {
+      } else if (currentMode === 'online_guest' && time - s.lastSyncTime >= 1000 / 120) {
         s.lastSyncTime = time;
         sendPeerPacket(propsRef.current.gameDataChannel, {
           type: 'guest-input',
@@ -2171,7 +2245,15 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         </div>
       )}
 
-      {isServing && stateRef.current.servePending && !winner && (
+      {countdownText !== null && !winner && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none">
+          <div className="rounded-2xl border border-rose-400/70 bg-slate-950/80 px-10 py-5 text-6xl font-black tracking-widest text-rose-300 shadow-[0_0_36px_rgba(244,63,94,0.45)]">
+            {countdownText}
+          </div>
+        </div>
+      )}
+
+      {isServing && stateRef.current.servePending && !stateRef.current.isGoalCountdown && !winner && (
         <div className="fixed bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 z-30 w-[calc(100vw-1rem)] max-w-xs -translate-x-1/2 pointer-events-none">
           <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-center shadow-lg pointer-events-auto">
             <p className="mb-2 text-xs font-medium text-slate-200">
@@ -2249,7 +2331,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       {/* Controls HUD Hint */}
       <div className="absolute bottom-3 left-4 z-20 flex items-center gap-3 text-xs text-slate-400/80 font-mono">
         <span className="hidden sm:inline px-2 py-1 rounded bg-slate-900/80 border border-slate-800 pointer-events-none">
-          Mouse / Touch / WASD: Move Mallet
+          Click table to lock mouse · Esc to release
         </span>
         <button
           type="button"
