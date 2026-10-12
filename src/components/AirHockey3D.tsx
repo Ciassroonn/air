@@ -188,7 +188,6 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const cursorRef = useRef<HTMLDivElement>(null);
-  const cursorPositionRef = useRef({ x: 0, y: 0 });
 
   // Score states
   const [playerScore, setPlayerScore] = useState(0);
@@ -1226,6 +1225,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     const s = stateRef.current;
 
     const handlePointerMove = (e: MouseEvent | TouchEvent) => {
+      if (s.isGoalCountdown) return;
       const rect = container.getBoundingClientRect();
       const halfW = s.tableWidth / 2;
       const halfL = s.tableLength / 2;
@@ -1235,11 +1235,6 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 
       if (!('touches' in e) && document.pointerLockElement === canvas) {
         const mouseEvent = e as MouseEvent;
-        cursorPositionRef.current.x = Math.max(0, Math.min(rect.width, cursorPositionRef.current.x + mouseEvent.movementX));
-        cursorPositionRef.current.y = Math.max(0, Math.min(rect.height, cursorPositionRef.current.y + mouseEvent.movementY));
-        if (cursorRef.current) {
-          cursorRef.current.style.transform = `translate(${cursorPositionRef.current.x}px, ${cursorPositionRef.current.y}px)`;
-        }
         const viewHeight = Math.max(34, 34 / (rect.width / rect.height));
         const moveScale = viewHeight / rect.height * (sens / 2.5);
         s.targetP1X += mouseEvent.movementX * moveScale;
@@ -1287,6 +1282,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (s.isGoalCountdown) return;
       if (e.key === 'Shift') {
         if (
           !e.repeat &&
@@ -1313,13 +1309,6 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         document.pointerLockElement === canvas
       ) return;
       const rect = container.getBoundingClientRect();
-      cursorPositionRef.current = {
-        x: Math.max(0, Math.min(rect.width, event.clientX - rect.left)),
-        y: Math.max(0, Math.min(rect.height, event.clientY - rect.top))
-      };
-      if (cursorRef.current) {
-        cursorRef.current.style.transform = `translate(${cursorPositionRef.current.x}px, ${cursorPositionRef.current.y}px)`;
-      }
       try {
         void canvas.requestPointerLock();
       } catch (error) {
@@ -1434,10 +1423,18 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       // 1. Update Player 1 position (Smooth lerp with velocity calculation)
       // Keyboard support for Player 1:
       const speed = 18 * dt;
-      if (s.keys['a'] || s.keys['arrowleft']) s.targetP1X -= speed;
-      if (s.keys['d'] || s.keys['arrowright']) s.targetP1X += speed;
-      if (s.keys['w'] || s.keys['arrowup']) s.targetP1Z -= speed;
-      if (s.keys['s'] || s.keys['arrowdown']) s.targetP1Z += speed;
+      if (s.isGoalCountdown) {
+        s.targetP1X = s.p1X;
+        s.targetP1Z = s.p1Z;
+        s.p1Vx = 0;
+        s.p1Vz = 0;
+        for (const key of Object.keys(s.keys)) s.keys[key] = false;
+      } else {
+        if (s.keys['a'] || s.keys['arrowleft']) s.targetP1X -= speed;
+        if (s.keys['d'] || s.keys['arrowright']) s.targetP1X += speed;
+        if (s.keys['w'] || s.keys['arrowup']) s.targetP1Z -= speed;
+        if (s.keys['s'] || s.keys['arrowdown']) s.targetP1Z += speed;
+      }
 
       // Clamp Player 1 to their half (Z > 0.6)
       const p1ClampW = halfW - malletR1 - 0.2;
@@ -2154,6 +2151,19 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         }
       }
 
+      if (s.camera && s.puckMesh && cursorRef.current) {
+        const container = containerRef.current;
+        if (container) {
+          s.camera.updateMatrixWorld();
+          const projectedPuck = s.puckMesh.position.clone().project(s.camera);
+          const cursorX = (projectedPuck.x * 0.5 + 0.5) * container.clientWidth;
+          const cursorY = (-projectedPuck.y * 0.5 + 0.5) * container.clientHeight;
+          cursorRef.current.style.transform = `translate(${cursorX}px, ${cursorY}px)`;
+          cursorRef.current.style.display =
+            projectedPuck.z >= -1 && projectedPuck.z <= 1 ? '' : 'none';
+        }
+      }
+
       // Exchange only the latest inputs and authoritative puck state over WebRTC.
       if (currentMode === 'online_host' && time - s.lastSyncTime >= 1000 / 120) {
         s.lastSyncTime = time;
@@ -2268,7 +2278,6 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
           ref={cursorRef}
           aria-hidden="true"
           className="pointer-events-none absolute left-0 top-0 z-50 -ml-px -mt-px drop-shadow-[0_1px_2px_rgba(0,0,0,0.9)]"
-          style={{ transform: `translate(${cursorPositionRef.current.x}px, ${cursorPositionRef.current.y}px)` }}
         >
           <svg width="18" height="22" viewBox="0 0 18 22" fill="none">
             <path d="M1 1V17L5.5 13L9 20L12 18.5L8.5 11.5L14 11L1 1Z" fill="white" stroke="#111827" strokeWidth="1.5" strokeLinejoin="round" />
@@ -2386,7 +2395,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       {/* Controls HUD Hint */}
       <div className="absolute bottom-3 left-4 z-20 flex items-center gap-3 text-xs text-slate-400/80 font-mono">
         <span className="hidden sm:inline px-2 py-1 rounded bg-slate-900/80 border border-slate-800 pointer-events-none">
-          Click table to lock mouse · Esc to release
+          Fake cursor tracks puck · Click table to lock mouse · Esc to release
         </span>
         <button
           type="button"
