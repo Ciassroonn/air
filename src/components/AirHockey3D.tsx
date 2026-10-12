@@ -1,0 +1,2276 @@
+import React, { useEffect, useRef, useState, useCallback } from 'react';
+import * as THREE from 'three';
+import confetti from 'canvas-confetti';
+import { sound } from '../services/sound';
+import { db, auth, RoomRecord } from '../firebase';
+import {
+  doc,
+  setDoc,
+  getDoc,
+  updateDoc,
+  onSnapshot,
+  collection,
+  query,
+  where,
+  getDocs
+} from 'firebase/firestore';
+
+export type GameMode = 'bot' | 'online_host' | 'online_guest';
+export type BotDifficulty = 'rookie' | 'normal' | 'pro' | 'god';
+export type CameraView = 'fpv' | 'top' | 'action' | 'classic';
+
+type PuckHitResult = {
+  x: number;
+  z: number;
+  vx: number;
+  vz: number;
+  hit: boolean;
+  powerShot: boolean;
+};
+
+function resolvePuckMalletHit(
+  puckX: number,
+  puckZ: number,
+  puckVx: number,
+  puckVz: number,
+  malletX: number,
+  malletZ: number,
+  malletVx: number,
+  malletVz: number,
+  puckRadius: number,
+  malletRadius: number,
+  powerShotArmed: boolean,
+  speedMultiplier: number
+): PuckHitResult | null {
+  const dx = puckX - malletX;
+  const dz = puckZ - malletZ;
+  const distance = Math.hypot(dx, dz);
+  const minDistance = puckRadius + malletRadius;
+
+  if (distance >= minDistance) return null;
+
+  // Normal points from the mallet toward the puck.
+  // If they overlap exactly, send the puck away from the mallet's half.
+  const nx = distance > 0.0001 ? dx / distance : 0;
+  const nz =
+    distance > 0.0001
+      ? dz / distance
+      : malletZ >= 0
+        ? -1
+        : 1;
+
+  // Separate overlapping objects slightly to avoid repeated contact.
+  const separation = minDistance + 0.02;
+  const x = malletX + nx * separation;
+  const z = malletZ + nz * separation;
+
+  const relativeVx = puckVx - malletVx;
+  const relativeVz = puckVz - malletVz;
+  const normalSpeed = relativeVx * nx + relativeVz * nz;
+
+  // Correct overlap, but don't bounce if the puck is already moving away.
+  if (normalSpeed >= 0) {
+    return { x, z, vx: puckVx, vz: puckVz, hit: false, powerShot: false };
+  }
+
+  // A restitution below 1 loses a little energy on impact.
+  const restitution = 0.82;
+  const impulse = -(1 + restitution) * normalSpeed;
+
+  let vx = puckVx + nx * impulse;
+  let vz = puckVz + nz * impulse;
+
+  // A small amount of sideways mallet motion helps aim swipe hits.
+  const malletNormalSpeed = malletVx * nx + malletVz * nz;
+  const tangentVx = malletVx - malletNormalSpeed * nx;
+  const tangentVz = malletVz - malletNormalSpeed * nz;
+
+  vx += tangentVx * 0.15;
+  vz += tangentVz * 0.15;
+
+  let usedPowerShot = false;
+
+  if (powerShotArmed) {
+    const malletSpeed = Math.hypot(malletVx, malletVz);
+
+    let aimX = nx * 0.85;
+    let aimZ = nz * 0.85;
+
+    if (malletSpeed > 0.1) {
+      aimX += (malletVx / malletSpeed) * 0.15;
+      aimZ += (malletVz / malletSpeed) * 0.15;
+    }
+
+    const aimLength = Math.hypot(aimX, aimZ) || 1;
+    const powerBoost = 9 * speedMultiplier;
+
+    vx += (aimX / aimLength) * powerBoost;
+    vz += (aimZ / aimLength) * powerBoost;
+    usedPowerShot = true;
+  }
+
+  return { x, z, vx, vz, hit: true, powerShot: usedPowerShot };
+}
+
+function sendPeerPacket(channel: RTCDataChannel | null | undefined, packet: object) {
+  if (!channel || channel.readyState !== 'open' || channel.bufferedAmount > 65_536) return;
+
+  try {
+    channel.send(JSON.stringify(packet));
+  } catch (error) {
+    console.error('Failed to send peer game data:', error);
+  }
+}
+
+const MALLET_FOLLOW_RESPONSE = -Math.log(0.08) * 60;
+
+function getMalletPosition(
+  x: number,
+  z: number,
+  targetX: number,
+  targetZ: number,
+  dt: number
+): [number, number] {
+  const followFactor = 1 - Math.exp(-MALLET_FOLLOW_RESPONSE * dt);
+  let moveX = (targetX - x) * followFactor;
+  let moveZ = (targetZ - z) * followFactor;
+  const moveDistance = Math.hypot(moveX, moveZ);
+  const maxMoveDistance = 40 * dt;
+
+  if (moveDistance > maxMoveDistance) {
+    const scale = maxMoveDistance / moveDistance;
+    moveX *= scale;
+    moveZ *= scale;
+  }
+
+  return [x + moveX, z + moveZ];
+}
+
+interface AirHockey3DProps {
+  mode: GameMode;
+  botDifficulty: BotDifficulty;
+  winningScore: number;
+  puckSpeedMultiplier: number;
+  puckFriction: number;
+  allowOwnGoals?: boolean;
+  onOnlinePhysicsSettingsChange?: (settings: { speedMultiplier: number; friction: number }) => void;
+  roomCode?: string;
+  onlineRoom?: RoomRecord | null;
+  gameDataChannel?: RTCDataChannel | null;
+  cameraView: CameraView;
+  mouseSensitivityMultiplier?: number;
+  helpDisabled?: boolean;
+  onAnnouncementChange?: (announcement: string) => void;
+  onGoalScored?: (scorer: 'player' | 'opponent', scores: { player: number; opponent: number }) => void;
+  onScoreUpdate?: (scores: { player: number; opponent: number }) => void;
+  onGameOver?: (winner: 'player' | 'opponent', scores: { player: number; opponent: number }) => void;
+}
+
+export const AirHockey3D: React.FC<AirHockey3DProps> = ({
+  mode,
+  botDifficulty,
+  winningScore = 10,
+  puckSpeedMultiplier,
+  puckFriction,
+  allowOwnGoals = true,
+  onOnlinePhysicsSettingsChange,
+  roomCode,
+  onlineRoom,
+  gameDataChannel,
+  cameraView = 'top',
+  mouseSensitivityMultiplier = 2.5,
+  helpDisabled = false,
+  onAnnouncementChange,
+  onGoalScored,
+  onScoreUpdate,
+  onGameOver
+}) => {
+  const containerRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  // Score states
+  const [playerScore, setPlayerScore] = useState(0);
+  const [opponentScore, setOpponentScore] = useState(0);
+  const [isServing, setIsServing] = useState(true);
+  const [isPuckInHitRange, setIsPuckInHitRange] = useState(false);
+  const [isPowerShotArmed, setIsPowerShotArmed] = useState(false);
+  const [selectedServeX, setSelectedServeX] = useState(0);
+  const [resetRequestStatus, setResetRequestStatus] = useState('');
+  const [winner, setWinner] = useState<'player' | 'opponent' | null>(null);
+
+  // References for render loop & physics mutable states to run at solid 60+ FPS without re-renders
+  const stateRef = useRef({
+    // Power shot state
+    p1PowerShotArmed: false,
+    p1PowerShotCooldown: 0,
+    p2PowerShotArmed: false,
+
+    // Table dimensions
+    tableWidth: 14,
+    tableLength: 26,
+    goalWidth: 4.4,
+    puckRadius: 0.55,
+    p1MalletRadius: 1.4, // Bigger player mallet
+    p2MalletRadius: 0.8, // Smaller bot / opponent mallet
+
+    // Puck state
+    puckX: 0,
+    puckZ: 0,
+    puckVx: 0,
+    puckVz: 0,
+    puckRailRecoveryTime: 0,
+    puckStuckTime: 0,
+    consecutivePostBounces: 0,
+    lastPostBounceTime: 0,
+    botStrikeUntil: 0,
+    puckResetVersion: 0,
+    lastSeenPuckResetVersion: null as number | null,
+    hostResetRequested: false,
+    guestResetRequested: false,
+    player1ResetRequested: false,
+    player2ResetRequested: false,
+    puckTargetY: 0.16,
+
+    // Player 1 mallet (Z > 0 side)
+    p1X: 0,
+    p1Z: 8.5,
+    p1PrevX: 0,
+    p1PrevZ: 8.5,
+    p1Vx: 0,
+    p1Vz: 0,
+
+    // Player 2 / Opponent / Bot mallet (Z < 0 side)
+    p2X: 0,
+    p2Z: -8.5,
+    p2PrevX: 0,
+    p2PrevZ: -8.5,
+    p2Vx: 0,
+    p2Vz: 0,
+
+    // Mouse / Pointer target
+    targetP1X: 0,
+    targetP1Z: 8.5,
+    targetP2X: 0,
+    targetP2Z: -8.5,
+
+    // Scores
+    p1Score: 0,
+    p2Score: 0,
+    gameOver: false,
+    isScoring: false,
+    servingWait: 1.2,
+    servePending: true,
+    serveDeadline: 0,
+    selectedServeX: 0,
+    serveSide: 'p1' as 'p1' | 'p2',
+    requestedServeX: null as number | null,
+    botServeReadyAt: 0,
+    botGracePeriodUntil: 0,
+    lastTouchedBy: null as 'player' | 'opponent' | null,
+    isGuestPredictingPaddleHit: false,
+
+    // Online sync throttle
+    lastSyncTime: 0,
+    lastRemotePaddleUpdateTime: 0,
+    lastHitCueUpdate: 0,
+    puckInHitRange: false,
+    appliedPuckSpeedMultiplier: 1,
+
+    // Key states for local 2-player mode
+    keys: {} as Record<string, boolean>,
+
+    // Three.js items
+    scene: null as THREE.Scene | null,
+    camera: null as THREE.PerspectiveCamera | null,
+    renderer: null as THREE.WebGLRenderer | null,
+    puckMesh: null as THREE.Mesh | null,
+    puckGlowMesh: null as THREE.Mesh | null,
+    p1Mesh: null as THREE.Group | null,
+    p2Mesh: null as THREE.Group | null,
+    tableRailLeft: null as THREE.Mesh | null,
+    tableRailRight: null as THREE.Mesh | null,
+    p1ScoreText: null as THREE.Mesh | null,
+    p2ScoreText: null as THREE.Mesh | null,
+    particles: [] as {
+      mesh: THREE.Mesh;
+      vx: number;
+      vy: number;
+      vz: number;
+      life: number;
+    }[],
+
+    // Animation frame ID
+    animId: 0
+  });
+
+  // Keep stateRef synced with props
+  const propsRef = useRef({
+    mode,
+    botDifficulty,
+    winningScore,
+    puckSpeedMultiplier,
+    puckFriction,
+    allowOwnGoals,
+    cameraView,
+    mouseSensitivityMultiplier,
+    onlineRoom,
+    gameDataChannel,
+    onGoalScored,
+    onScoreUpdate,
+    onGameOver,
+    helpDisabled,
+    onAnnouncementChange,
+    onOnlinePhysicsSettingsChange
+  });
+
+  useEffect(() => {
+    propsRef.current = {
+      mode,
+      botDifficulty,
+      winningScore,
+      puckSpeedMultiplier,
+      puckFriction,
+      allowOwnGoals,
+      cameraView,
+      mouseSensitivityMultiplier,
+      onlineRoom,
+      gameDataChannel,
+      onGoalScored,
+      onScoreUpdate,
+      onGameOver,
+      helpDisabled,
+      onAnnouncementChange,
+      onOnlinePhysicsSettingsChange
+    };
+  }, [mode, botDifficulty, winningScore, puckSpeedMultiplier, puckFriction, allowOwnGoals, cameraView, mouseSensitivityMultiplier, onlineRoom, gameDataChannel, onGoalScored, onScoreUpdate, onGameOver, helpDisabled, onAnnouncementChange, onOnlinePhysicsSettingsChange]);
+
+  const announce = useCallback((message: string) => {
+    propsRef.current.onAnnouncementChange?.(message);
+  }, []);
+
+  const completePuckReset = useCallback(() => {
+    const s = stateRef.current;
+    s.puckX = 0;
+    s.puckZ = 0;
+    s.puckVx = 0;
+    s.puckVz = 0;
+    s.puckRailRecoveryTime = 0;
+    s.puckResetVersion += 1;
+    s.hostResetRequested = false;
+    s.guestResetRequested = false;
+    s.player1ResetRequested = false;
+    s.player2ResetRequested = false;
+    setResetRequestStatus('');
+    sound.playWhistle();
+    announce('PUCK RESET TO CENTER');
+    setTimeout(() => announce(''), 1200);
+  }, [announce]);
+
+  // Read initial scores from the room; live match state comes through WebRTC.
+  useEffect(() => {
+    if (!onlineRoom || (mode !== 'online_guest' && mode !== 'online_host')) return;
+    const s = stateRef.current;
+    const player = mode === 'online_guest' ? onlineRoom.guestScore : onlineRoom.hostScore;
+    const opponent = mode === 'online_guest' ? onlineRoom.hostScore : onlineRoom.guestScore;
+    s.p1Score = player;
+    s.p2Score = opponent;
+    setPlayerScore(player);
+    setOpponentScore(opponent);
+  }, [onlineRoom, mode]);
+
+  useEffect(() => {
+    if (mode !== 'online_guest' && mode !== 'online_host') return;
+
+    const hostColor = onlineRoom?.hostColor ?? 'blue';
+    const localColor = mode === 'online_host' ? hostColor : hostColor === 'blue' ? 'red' : 'blue';
+    const opponentColor = localColor === 'blue' ? 'red' : 'blue';
+    const colors = {
+      blue: { main: 0x168bff, glow: 0x38bdf8 },
+      red: { main: 0xef3340, glow: 0xff6670 }
+    };
+    const applySideColor = (group: THREE.Group | null, color: 'red' | 'blue') => {
+      if (!group) return;
+      group.traverse(object => {
+        if (!(object instanceof THREE.Mesh)) return;
+        const materials = Array.isArray(object.material) ? object.material : [object.material];
+        for (const material of materials) {
+          const role = material.userData.colorRole;
+          if (role === 'main') material.color.setHex(colors[color].main);
+          if (role === 'glow') material.color.setHex(colors[color].glow);
+          if (role === 'main' && material instanceof THREE.MeshStandardMaterial) {
+            material.emissive.setHex(colors[color].glow);
+          }
+        }
+      });
+    };
+
+    applySideColor(stateRef.current.p1Mesh, localColor);
+    applySideColor(stateRef.current.p2Mesh, opponentColor);
+  }, [mode, onlineRoom?.hostColor]);
+
+  useEffect(() => {
+    if (!gameDataChannel) return;
+
+    gameDataChannel.onmessage = event => {
+      let packet: Record<string, unknown>;
+      try {
+        packet = JSON.parse(String(event.data)) as Record<string, unknown>;
+      } catch (error) {
+        console.error('Received invalid peer game data:', error);
+        return;
+      }
+
+      const s = stateRef.current;
+      if (
+        propsRef.current.mode === 'online_host' &&
+        packet.type === 'guest-input' &&
+        typeof packet.x === 'number' &&
+        typeof packet.z === 'number' &&
+        typeof packet.vx === 'number' &&
+        typeof packet.vz === 'number'
+      ) {
+        s.p2X = packet.x;
+        s.p2Z = -packet.z;
+        s.p2Vx = Math.max(-30, Math.min(30, packet.vx));
+        s.p2Vz = Math.max(-30, Math.min(30, -packet.vz));
+        if (typeof packet.powerShotArmed === 'boolean') {
+          s.p2PowerShotArmed = packet.powerShotArmed;
+        }
+        s.lastRemotePaddleUpdateTime = performance.now();
+      } else if (
+        propsRef.current.mode === 'online_guest' &&
+        packet.type === 'guest-power-shot-used'
+      ) {
+        s.p1PowerShotArmed = false;
+        s.p1PowerShotCooldown = 3;
+        setIsPowerShotArmed(false);
+      } else if (
+        propsRef.current.mode === 'online_host' &&
+        packet.type === 'serve-request' &&
+        typeof packet.x === 'number'
+      ) {
+        s.requestedServeX = Math.max(-3.5, Math.min(3.5, packet.x));
+      } else if (
+        propsRef.current.mode === 'online_host' &&
+        packet.type === 'puck-reset-request' &&
+        !s.gameOver &&
+        !s.servePending
+      ) {
+        s.guestResetRequested = true;
+        if (s.hostResetRequested) {
+          completePuckReset();
+        } else {
+          setResetRequestStatus('Opponent requested a puck reset');
+        }
+      } else if (
+        propsRef.current.mode === 'online_guest' &&
+        packet.type === 'host-state' &&
+        ['puckX', 'puckZ', 'puckVx', 'puckVz', 'hostPaddleX', 'hostPaddleZ', 'hostScore', 'guestScore']
+          .every(key => typeof packet[key] === 'number') &&
+        typeof packet.gameOver === 'boolean'
+      ) {
+        s.puckX = packet.puckX as number;
+        s.puckZ = -(packet.puckZ as number);
+        s.puckVx = packet.puckVx as number;
+        s.puckVz = -(packet.puckVz as number);
+        s.p2X = packet.hostPaddleX as number;
+        s.p2Z = -(packet.hostPaddleZ as number);
+        s.p1Score = packet.guestScore as number;
+        s.p2Score = packet.hostScore as number;
+        s.servePending = packet.servePending as boolean;
+        s.serveSide = packet.serveSide as 'p1' | 'p2';
+        if (typeof packet.puckResetVersion === 'number') {
+          if (
+            s.lastSeenPuckResetVersion !== null &&
+            packet.puckResetVersion !== s.lastSeenPuckResetVersion
+          ) {
+            s.guestResetRequested = false;
+          }
+          s.lastSeenPuckResetVersion = packet.puckResetVersion;
+        }
+        if (typeof packet.resetVotes === 'number') {
+          const resetVotes = Math.max(0, Math.min(2, packet.resetVotes));
+          setResetRequestStatus(
+            resetVotes === 0 && !s.guestResetRequested
+              ? ''
+              : s.guestResetRequested
+                ? 'Waiting for the opponent to agree'
+                : 'Opponent requested a puck reset'
+          );
+        }
+        if (
+          typeof packet.puckSpeedMultiplier === 'number' &&
+          typeof packet.puckFriction === 'number'
+        ) {
+          propsRef.current.onOnlinePhysicsSettingsChange?.({
+            speedMultiplier: Math.max(0.5, Math.min(1.5, packet.puckSpeedMultiplier)),
+            friction: Math.max(0.01, Math.min(0.3, packet.puckFriction))
+          });
+        }
+        setIsServing(s.servePending);
+        if (s.servePending) {
+          announce(s.serveSide === 'p2' ? 'YOUR SERVE' : 'OPPONENT SERVE');
+        } else if (!packet.gameOver) {
+          announce('');
+        }
+        setPlayerScore(s.p1Score);
+        setOpponentScore(s.p2Score);
+        if (s.gameOver !== packet.gameOver) {
+          s.gameOver = packet.gameOver;
+          setWinner(packet.gameOver ? (s.p1Score >= propsRef.current.winningScore ? 'player' : 'opponent') : null);
+          announce(packet.gameOver ? (s.p1Score >= propsRef.current.winningScore ? 'VICTORY!' : 'GAME OVER') : '');
+        }
+      }
+    };
+
+    return () => {
+      gameDataChannel.onmessage = null;
+    };
+  }, [gameDataChannel, announce, completePuckReset]);
+
+  // Particle explosion helper with strict collision particle limit and pooling
+  const triggerSparks = useCallback((x: number, y: number, z: number, colorHex: number, count = 8) => {
+    const s = stateRef.current;
+    if (!s.scene) return;
+
+    // Enforce max active particles limit (25 max) to guarantee zero lag
+    const MAX_PARTICLES = 25;
+    while (s.particles.length + count > MAX_PARTICLES && s.particles.length > 0) {
+      const old = s.particles.shift();
+      if (old) {
+        s.scene.remove(old.mesh);
+        old.mesh.geometry.dispose();
+      }
+    }
+
+    for (let i = 0; i < count; i++) {
+      const geo = new THREE.SphereGeometry(0.08, 4, 4);
+      const mat = new THREE.MeshBasicMaterial({
+        color: colorHex,
+        transparent: true,
+        opacity: 1
+      });
+      const spark = new THREE.Mesh(geo, mat);
+      spark.position.set(x, y, z);
+      s.scene.add(spark);
+
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 2 + Math.random() * 5;
+      s.particles.push({
+        mesh: spark,
+        vx: Math.cos(angle) * speed,
+        vy: 1.0 + Math.random() * 4,
+        vz: Math.sin(angle) * speed,
+        life: 0.25 + Math.random() * 0.25
+      });
+    }
+  }, []);
+
+  // Serve puck after goal
+  const servePuck = useCallback((server: 'p1' | 'p2', x = 0) => {
+    const s = stateRef.current;
+    const serveX = Math.max(-3.5, Math.min(3.5, x));
+    s.hostResetRequested = false;
+    s.guestResetRequested = false;
+    s.player1ResetRequested = false;
+    s.player2ResetRequested = false;
+    setResetRequestStatus('');
+    s.puckX = serveX;
+    s.puckZ = server === 'p1' ? 4 : -4;
+    s.puckVx = (-serveX * 0.55 + (Math.random() - 0.5) * 1.2) * propsRef.current.puckSpeedMultiplier;
+    s.puckVz = (server === 'p1' ? -7 : 7) * propsRef.current.puckSpeedMultiplier;
+    s.puckRailRecoveryTime = 0;
+    s.servePending = false;
+    s.serveDeadline = 0;
+    s.serveSide = server;
+    s.requestedServeX = null;
+    s.isScoring = false;
+    s.servingWait = 0;
+    s.botServeReadyAt = 0;
+    setIsServing(true);
+    announce('SERVE!');
+    sound.playWhistle();
+
+    setTimeout(() => {
+      setIsServing(false);
+      announce('');
+    }, 450);
+  }, [announce]);
+
+  // Reset complete match
+  const resetMatch = useCallback(() => {
+    const s = stateRef.current;
+    s.p1Score = 0;
+    s.p2Score = 0;
+    s.gameOver = false;
+    s.isScoring = false;
+    s.p1X = 0;
+    s.p1Z = 8.5;
+    s.targetP1Z = 8.5;
+    s.p2X = 0;
+    s.p2Z = -8.5;
+    s.targetP2Z = -8.5;
+    s.puckX = 0;
+    s.puckZ = 4;
+    s.puckVx = 0;
+    s.puckVz = 0;
+    s.puckRailRecoveryTime = 0;
+    s.puckStuckTime = 0;
+    s.consecutivePostBounces = 0;
+    s.lastPostBounceTime = 0;
+    s.botStrikeUntil = 0;
+    s.hostResetRequested = false;
+    s.guestResetRequested = false;
+    s.player1ResetRequested = false;
+    s.player2ResetRequested = false;
+    s.p1PowerShotArmed = false;
+    s.p1PowerShotCooldown = 0;
+    s.p2PowerShotArmed = false;
+    setIsPowerShotArmed(false);
+    setResetRequestStatus('');
+    s.servePending = true;
+    s.serveDeadline = performance.now() + 2000;
+    s.selectedServeX = 0;
+    s.serveSide = 'p1';
+    s.requestedServeX = null;
+    s.botGracePeriodUntil = performance.now() + 1500;
+    setIsServing(true);
+    setSelectedServeX(0);
+    setPlayerScore(0);
+    setOpponentScore(0);
+    setWinner(null);
+    announce('CHOOSE YOUR SERVE');
+    sound.playWhistle();
+    propsRef.current.onScoreUpdate?.({ player: 0, opponent: 0 });
+    setTimeout(() => {
+      announce('');
+    }, 1000);
+  }, [announce]);
+
+  // Setup Three.js scene
+  useEffect(() => {
+    const container = containerRef.current;
+    const canvas = canvasRef.current;
+    if (!container || !canvas) return;
+
+    const s = stateRef.current;
+
+    // 1. Scene
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x040711);
+    scene.fog = new THREE.FogExp2(0x040711, 0.022);
+    s.scene = scene;
+
+    // 2. Camera
+    const camera = new THREE.PerspectiveCamera(
+      65,
+      container.clientWidth / container.clientHeight,
+      0.1,
+      100
+    );
+    s.camera = camera;
+
+    // 3. Renderer
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      powerPreference: 'high-performance'
+    });
+    renderer.setSize(container.clientWidth, container.clientHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.25;
+    s.renderer = renderer;
+
+    // 4. Lighting
+    const ambientLight = new THREE.AmbientLight(0x223355, 0.8);
+    scene.add(ambientLight);
+
+    // Main table spotlight
+    const spotLight = new THREE.SpotLight(0xddeeff, 2.8);
+    spotLight.position.set(0, 18, 0);
+    spotLight.angle = Math.PI / 3;
+    spotLight.penumbra = 0.5;
+    spotLight.decay = 1.2;
+    spotLight.distance = 45;
+    spotLight.castShadow = true;
+    spotLight.shadow.mapSize.width = 1024;
+    spotLight.shadow.mapSize.height = 1024;
+    scene.add(spotLight);
+
+    // Blue/Cyan side glow (Player side)
+    const p1PointLight = new THREE.PointLight(0x00e5ff, 2.2, 18);
+    p1PointLight.position.set(0, 4, 10);
+    scene.add(p1PointLight);
+
+    // Crimson Red side glow (Bot / Opponent side)
+    const p2PointLight = new THREE.PointLight(0xff1744, 2.8, 20);
+    p2PointLight.position.set(0, 4, -10);
+    scene.add(p2PointLight);
+
+    // 5. Table Geometry & Materials
+    const halfW = s.tableWidth / 2;
+    const halfL = s.tableLength / 2;
+    const goalHalfW = s.goalWidth / 2;
+    const halfTableLength = s.tableLength / 2;
+
+    // Player half (Z > 0): Sleek neon navy blue
+    const playerSurfaceGeo = new THREE.BoxGeometry(s.tableWidth, 0.3, halfTableLength);
+    const playerSurfaceMat = new THREE.MeshStandardMaterial({
+      color: 0x0f1d35,
+      roughness: 0.22,
+      metalness: 0.32,
+      envMapIntensity: 0.8
+    });
+    const playerRinkMesh = new THREE.Mesh(playerSurfaceGeo, playerSurfaceMat);
+    playerRinkMesh.position.set(0, -0.15, halfTableLength / 2);
+    playerRinkMesh.receiveShadow = true;
+    scene.add(playerRinkMesh);
+
+    // Bot half (Z < 0): Bold vibrant crimson RED
+    const botSurfaceGeo = new THREE.BoxGeometry(s.tableWidth, 0.3, halfTableLength);
+    const botSurfaceMat = new THREE.MeshStandardMaterial({
+      color: 0x991b1b,
+      emissive: 0x240508,
+      roughness: 0.22,
+      metalness: 0.35,
+      envMapIntensity: 0.9
+    });
+    const botRinkMesh = new THREE.Mesh(botSurfaceGeo, botSurfaceMat);
+    botRinkMesh.position.set(0, -0.15, -halfTableLength / 2);
+    botRinkMesh.receiveShadow = true;
+    scene.add(botRinkMesh);
+
+    // Rink Markings
+    const linesGroup = new THREE.Group();
+    linesGroup.position.y = 0.01;
+
+    // Center dividing red line
+    const centerLineGeo = new THREE.PlaneGeometry(s.tableWidth, 0.12);
+    const centerLineMat = new THREE.MeshBasicMaterial({ color: 0xff1744, side: THREE.DoubleSide });
+    const centerLine = new THREE.Mesh(centerLineGeo, centerLineMat);
+    centerLine.rotation.x = -Math.PI / 2;
+    linesGroup.add(centerLine);
+
+    // Center glowing circle
+    const centerRingGeo = new THREE.RingGeometry(2.4, 2.52, 48);
+    const centerRingMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, side: THREE.DoubleSide });
+    const centerRing = new THREE.Mesh(centerRingGeo, centerRingMat);
+    centerRing.rotation.x = -Math.PI / 2;
+    linesGroup.add(centerRing);
+
+    // Center faceoff dot
+    const centerDotGeo = new THREE.CircleGeometry(0.4, 24);
+    const centerDotMat = new THREE.MeshBasicMaterial({ color: 0xff0066, side: THREE.DoubleSide });
+    const centerDot = new THREE.Mesh(centerDotGeo, centerDotMat);
+    centerDot.rotation.x = -Math.PI / 2;
+    linesGroup.add(centerDot);
+
+    // Faceoff rings on each half add clearer rink structure.
+    for (const z of [-halfL * 0.48, halfL * 0.48]) {
+      const isBotSide = z < 0;
+      const faceoffRing = new THREE.Mesh(
+        new THREE.RingGeometry(1.15, 1.22, 48),
+        new THREE.MeshBasicMaterial({
+          color: isBotSide ? 0xff4d6d : 0x9bb8d6,
+          transparent: true,
+          opacity: 0.72,
+          side: THREE.DoubleSide
+        })
+      );
+      faceoffRing.rotation.x = -Math.PI / 2;
+      faceoffRing.position.z = z;
+      linesGroup.add(faceoffRing);
+
+      const faceoffDot = new THREE.Mesh(
+        new THREE.CircleGeometry(0.16, 24),
+        new THREE.MeshBasicMaterial({
+          color: isBotSide ? 0xff0055 : 0xdbeafe,
+          transparent: true,
+          opacity: 0.85,
+          side: THREE.DoubleSide
+        })
+      );
+      faceoffDot.rotation.x = -Math.PI / 2;
+      faceoffDot.position.z = z;
+      linesGroup.add(faceoffDot);
+    }
+
+    // Player 1 Goal Crease arc
+    const p1CreaseGeo = new THREE.RingGeometry(2.8, 2.92, 32, 1, 0, Math.PI);
+    const p1CreaseMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, side: THREE.DoubleSide });
+    const p1Crease = new THREE.Mesh(p1CreaseGeo, p1CreaseMat);
+    p1Crease.rotation.x = -Math.PI / 2;
+    p1Crease.rotation.z = Math.PI;
+    p1Crease.position.z = halfL;
+    linesGroup.add(p1Crease);
+
+    // Player 2 Goal Crease arc
+    const p2CreaseGeo = new THREE.RingGeometry(2.8, 2.92, 32, 1, 0, Math.PI);
+    const p2CreaseMat = new THREE.MeshBasicMaterial({ color: 0xff0066, side: THREE.DoubleSide });
+    const p2Crease = new THREE.Mesh(p2CreaseGeo, p2CreaseMat);
+    p2Crease.rotation.x = -Math.PI / 2;
+    p2Crease.position.z = -halfL;
+    linesGroup.add(p2Crease);
+
+    scene.add(linesGroup);
+
+    // Air Holes pattern texture / illusion: Subtle micro grid
+    const gridHelper = new THREE.GridHelper(s.tableWidth, 28, 0x00e5ff, 0x112233);
+    gridHelper.position.y = 0.005;
+    gridHelper.scale.z = s.tableLength / s.tableWidth;
+    scene.add(gridHelper);
+
+    // Rails (Side and End Rails with Goal Cutouts)
+    const railHeight = 0.8;
+    const railThickness = 0.7;
+
+    const railMaterial = new THREE.MeshStandardMaterial({
+      color: 0x151c2e,
+      roughness: 0.25,
+      metalness: 0.85
+    });
+
+    const neonCyanMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
+    const neonPinkMat = new THREE.MeshBasicMaterial({ color: 0xff0066 });
+
+    // Left Rail
+    const leftRailGeo = new THREE.BoxGeometry(railThickness, railHeight, s.tableLength);
+    const leftRail = new THREE.Mesh(leftRailGeo, railMaterial);
+    leftRail.position.set(-halfW - railThickness / 2, railHeight / 2, 0);
+    leftRail.castShadow = true;
+    leftRail.receiveShadow = true;
+    scene.add(leftRail);
+
+    // Left Rail Neon Trim
+    const leftTrimGeo = new THREE.BoxGeometry(0.12, 0.12, s.tableLength);
+    const leftTrim = new THREE.Mesh(leftTrimGeo, neonCyanMat);
+    leftTrim.position.set(-halfW - 0.06, railHeight + 0.06, 0);
+    scene.add(leftTrim);
+
+    // Right Rail
+    const rightRailGeo = new THREE.BoxGeometry(railThickness, railHeight, s.tableLength);
+    const rightRail = new THREE.Mesh(rightRailGeo, railMaterial);
+    rightRail.position.set(halfW + railThickness / 2, railHeight / 2, 0);
+    rightRail.castShadow = true;
+    rightRail.receiveShadow = true;
+    scene.add(rightRail);
+
+    // Right Rail Neon Trim
+    const rightTrim = new THREE.Mesh(leftTrimGeo, neonCyanMat);
+    rightTrim.position.set(halfW + 0.06, railHeight + 0.06, 0);
+    scene.add(rightTrim);
+
+    // End Rails (with goal gap in middle)
+    const endSegmentWidth = (s.tableWidth - s.goalWidth) / 2;
+
+    const createEndRail = (zPos: number, isP1: boolean) => {
+      const trimMat = isP1 ? neonCyanMat : neonPinkMat;
+
+      // Left segment
+      const segLeftGeo = new THREE.BoxGeometry(endSegmentWidth, railHeight, railThickness);
+      const segLeft = new THREE.Mesh(segLeftGeo, railMaterial);
+      segLeft.position.set(-halfW + endSegmentWidth / 2, railHeight / 2, zPos);
+      segLeft.castShadow = true;
+      segLeft.receiveShadow = true;
+      scene.add(segLeft);
+
+      const trimLeftGeo = new THREE.BoxGeometry(endSegmentWidth, 0.12, 0.12);
+      const trimLeft = new THREE.Mesh(trimLeftGeo, trimMat);
+      trimLeft.position.set(-halfW + endSegmentWidth / 2, railHeight + 0.06, zPos + (isP1 ? -0.06 : 0.06));
+      scene.add(trimLeft);
+
+      // Right segment
+      const segRight = new THREE.Mesh(segLeftGeo, railMaterial);
+      segRight.position.set(halfW - endSegmentWidth / 2, railHeight / 2, zPos);
+      segRight.castShadow = true;
+      segRight.receiveShadow = true;
+      scene.add(segRight);
+
+      const trimRight = new THREE.Mesh(trimLeftGeo, trimMat);
+      trimRight.position.set(halfW - endSegmentWidth / 2, railHeight + 0.06, zPos + (isP1 ? -0.06 : 0.06));
+      scene.add(trimRight);
+
+      // Goal Pocket Backing Box (catches puck)
+      const goalPocketGeo = new THREE.BoxGeometry(s.goalWidth, 0.6, 1.4);
+      const goalPocketMat = new THREE.MeshStandardMaterial({
+        color: 0x05070f,
+        roughness: 0.8
+      });
+      const goalPocket = new THREE.Mesh(goalPocketGeo, goalPocketMat);
+      goalPocket.position.set(0, 0.3, zPos + (isP1 ? 0.7 : -0.7));
+      scene.add(goalPocket);
+
+      // Dark goal net keeps the opening visible without competing with the frame.
+      const pocketNetGeo = new THREE.BoxGeometry(s.goalWidth + 0.1, 0.68, 1.48);
+      const pocketNetMat = new THREE.MeshBasicMaterial({
+        color: 0x171016,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.35
+      });
+      const pocketNet = new THREE.Mesh(pocketNetGeo, pocketNetMat);
+      pocketNet.position.set(0, 0.34, zPos + (isP1 ? 0.74 : -0.74));
+      scene.add(pocketNet);
+
+      // Solid red goal frame, with supports anchored just outside the goal mouth.
+      const goalFrameMaterial = new THREE.MeshStandardMaterial({
+        color: 0x8f1230,
+        roughness: 0.3,
+        metalness: 0.35
+      });
+      const frameDepth = 0.48;
+      const framePostWidth = 0.42;
+      const frameWidth = s.goalWidth + framePostWidth + 0.3;
+      const framePostHeight = 1.15;
+      const crossbarHeight = 0.34;
+      const crossbarY = framePostHeight + crossbarHeight / 2;
+      const frameZ = zPos;
+
+      // Top of the goal: Radiant Neon Crossbar Header
+      const goalNeonColor = isP1 ? 0x00f0ff : 0xff1744;
+      const goalAccentNeon = isP1 ? 0x67e8f9 : 0xff5277;
+      const crossbarNeonMat = new THREE.MeshBasicMaterial({
+        color: goalNeonColor
+      });
+      const crossbar = new THREE.Mesh(
+        new THREE.BoxGeometry(frameWidth, crossbarHeight, frameDepth),
+        crossbarNeonMat
+      );
+      crossbar.position.set(0, crossbarY, frameZ);
+      scene.add(crossbar);
+
+      // Neon Top Crown Trim
+      const crownGeo = new THREE.BoxGeometry(frameWidth + 0.18, 0.14, frameDepth + 0.1);
+      const crownMesh = new THREE.Mesh(crownGeo, new THREE.MeshBasicMaterial({ color: goalAccentNeon }));
+      crownMesh.position.set(0, crossbarY + crossbarHeight / 2 + 0.07, frameZ);
+      scene.add(crownMesh);
+
+      // Glowing Neon Tube running across the top of the goal
+      const neonTubeGeo = new THREE.CylinderGeometry(0.1, 0.1, frameWidth + 0.2, 16);
+      const neonTubeMesh = new THREE.Mesh(
+        neonTubeGeo,
+        new THREE.MeshBasicMaterial({ color: goalNeonColor })
+      );
+      neonTubeMesh.rotation.z = Math.PI / 2;
+      neonTubeMesh.position.set(0, crossbarY + crossbarHeight / 2 + 0.18, frameZ);
+      scene.add(neonTubeMesh);
+
+      // Neon Tube Soft Outer Halo
+      const neonHaloGeo = new THREE.CylinderGeometry(0.2, 0.2, frameWidth + 0.24, 16);
+      const neonHaloMesh = new THREE.Mesh(
+        neonHaloGeo,
+        new THREE.MeshBasicMaterial({
+          color: goalNeonColor,
+          transparent: true,
+          opacity: 0.45
+        })
+      );
+      neonHaloMesh.rotation.z = Math.PI / 2;
+      neonHaloMesh.position.set(0, crossbarY + crossbarHeight / 2 + 0.18, frameZ);
+      scene.add(neonHaloMesh);
+
+      // Localized neon point light illuminating the goal entrance
+      const topGoalLight = new THREE.PointLight(goalNeonColor, 3.8, 9);
+      topGoalLight.position.set(0, crossbarY + 0.45, frameZ);
+      scene.add(topGoalLight);
+
+      const framePostGeo = new THREE.BoxGeometry(framePostWidth, framePostHeight, frameDepth);
+      for (const side of [-1, 1]) {
+        const framePost = new THREE.Mesh(framePostGeo, goalFrameMaterial);
+        framePost.position.set(side * (goalHalfW + 0.15), framePostHeight / 2, frameZ);
+        framePost.castShadow = true;
+        framePost.receiveShadow = true;
+        scene.add(framePost);
+      }
+
+      // Goal Sensor Neon Glow
+      const sensorGeo = new THREE.BoxGeometry(s.goalWidth, 0.1, 0.1);
+      const sensorMesh = new THREE.Mesh(sensorGeo, trimMat);
+      sensorMesh.position.set(0, 0.05, zPos);
+      scene.add(sensorMesh);
+    };
+
+    createEndRail(halfL + railThickness / 2, true);
+    createEndRail(-halfL - railThickness / 2, false);
+
+    // 6. 3D Mallets (Player 1 and Player 2 / Opponent)
+    const createMallet = (isP1: boolean) => {
+      const radius = isP1 ? s.p1MalletRadius : s.p2MalletRadius;
+      const group = new THREE.Group();
+
+      const sideColor = isP1 ? 0x00d4ff : 0xff3f76;
+      const deckMat = new THREE.MeshStandardMaterial({
+        color: isP1 ? 0x164653 : 0x55233b,
+        roughness: 0.28,
+        metalness: 0.78
+      });
+      const accentMat = new THREE.MeshStandardMaterial({
+        color: sideColor,
+        roughness: 0.22,
+        metalness: 0.55,
+        emissive: sideColor,
+        emissiveIntensity: 0.5
+      });
+      accentMat.userData.colorRole = 'main';
+      const glowMat = new THREE.MeshBasicMaterial({ color: sideColor });
+      glowMat.userData.colorRole = 'glow';
+      const darkMetalMat = new THREE.MeshStandardMaterial({
+        color: 0x121a25,
+        roughness: 0.24,
+        metalness: 0.86
+      });
+
+      const addCylinder = (
+        topRadius: number,
+        bottomRadius: number,
+        height: number,
+        y: number,
+        material: THREE.Material
+      ) => {
+        const mesh = new THREE.Mesh(
+          new THREE.CylinderGeometry(topRadius, bottomRadius, height, 48),
+          material
+        );
+        mesh.position.y = y;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        group.add(mesh);
+        return mesh;
+      };
+
+      const addRing = (ringRadius: number, tube: number, y: number, material: THREE.Material) => {
+        const ring = new THREE.Mesh(
+          new THREE.TorusGeometry(ringRadius, tube, 10, 48),
+          material
+        );
+        ring.rotation.x = Math.PI / 2;
+        ring.position.y = y;
+        group.add(ring);
+        return ring;
+      };
+
+      addCylinder(radius * 0.9, radius, 0.24, 0.14, darkMetalMat);
+      addRing(radius * 0.88, 0.065, 0.17, glowMat);
+      addCylinder(radius * 0.78, radius * 0.84, 0.12, 0.31, deckMat);
+      addRing(radius * 0.68, 0.045, 0.38, accentMat);
+      addCylinder(radius * 0.52, radius * 0.58, 0.075, 0.405, accentMat);
+
+      const centerLens = new THREE.Mesh(
+        new THREE.SphereGeometry(radius * 0.2, 24, 16),
+        glowMat
+      );
+      centerLens.scale.y = 0.28;
+      centerLens.position.y = 0.46;
+      centerLens.castShadow = true;
+      group.add(centerLens);
+
+      for (let index = 0; index < 3; index++) {
+        const marker = new THREE.Mesh(
+          new THREE.BoxGeometry(radius * 0.09, 0.025, radius * 0.25),
+          glowMat
+        );
+        const angle = (index / 3) * Math.PI * 2;
+        marker.position.set(
+          Math.cos(angle) * radius * 0.43,
+          0.45,
+          Math.sin(angle) * radius * 0.43
+        );
+        marker.rotation.y = -angle;
+        group.add(marker);
+      }
+
+      return group;
+    };
+
+    const p1Mallet = createMallet(true);
+    p1Mallet.position.set(0, 0, 7.0);
+    scene.add(p1Mallet);
+    s.p1Mesh = p1Mallet;
+
+    const p2Mallet = createMallet(false);
+    p2Mallet.position.set(0, 0, -7.0);
+    scene.add(p2Mallet);
+    s.p2Mesh = p2Mallet;
+
+    // 7. 3D Puck
+    const puckGeo = new THREE.CylinderGeometry(s.puckRadius, s.puckRadius, 0.24, 32);
+    const puckMat = new THREE.MeshStandardMaterial({
+      color: 0xff6a24,
+      roughness: 0.12,
+      metalness: 0.55,
+      emissive: 0xff3b12,
+      emissiveIntensity: 2.2
+    });
+    const puckMesh = new THREE.Mesh(puckGeo, puckMat);
+    puckMesh.position.set(0, 0.12, 0);
+    puckMesh.castShadow = true;
+    scene.add(puckMesh);
+    s.puckMesh = puckMesh;
+
+    // Puck glowing center core
+    const puckCoreGeo = new THREE.CylinderGeometry(s.puckRadius * 0.55, s.puckRadius * 0.55, 0.26, 24);
+    const puckCoreMat = new THREE.MeshBasicMaterial({ color: 0xfff0c2 });
+    const puckCore = new THREE.Mesh(puckCoreGeo, puckCoreMat);
+    puckMesh.add(puckCore);
+    const puckHalo = new THREE.Mesh(
+      new THREE.TorusGeometry(s.puckRadius * 0.9, 0.075, 8, 40),
+      new THREE.MeshBasicMaterial({ color: 0x29f4ff, transparent: true, opacity: 0.98 })
+    );
+    puckHalo.rotation.x = Math.PI / 2;
+    puckHalo.position.y = 0.16;
+    puckMesh.add(puckHalo);
+    const puckLight = new THREE.PointLight(0xff4dff, 2.4, 6);
+    puckLight.position.y = 0.35;
+    puckMesh.add(puckLight);
+
+    // 8. Arena Environment (Stands, Floating Arena Lights)
+    const arenaDomeGeo = new THREE.SphereGeometry(45, 24, 16);
+    const arenaDomeMat = new THREE.MeshBasicMaterial({
+      color: 0x050b18,
+      side: THREE.BackSide
+    });
+    const arenaDome = new THREE.Mesh(arenaDomeGeo, arenaDomeMat);
+    scene.add(arenaDome);
+
+    // Handle Window Resize
+    const handleResize = () => {
+      if (!container || !camera || !renderer) return;
+      camera.aspect = container.clientWidth / container.clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(container.clientWidth, container.clientHeight);
+    };
+    window.addEventListener('resize', handleResize);
+
+    // Start with puck in the middle
+    s.puckX = 0;
+    s.puckZ = 4;
+    s.puckVx = 0;
+    s.puckVz = 0;
+    s.isScoring = false;
+    s.servePending = true;
+    s.serveDeadline = performance.now() + 2000;
+    s.selectedServeX = 0;
+    s.serveSide = 'p1';
+    s.requestedServeX = null;
+    setIsServing(true);
+    setSelectedServeX(0);
+    announce('CHOOSE YOUR SERVE');
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      renderer.dispose();
+      cancelAnimationFrame(s.animId);
+    };
+  }, [triggerSparks, servePuck, announce]);
+
+  // Input listeners (Mouse, Touch, Keyboard)
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    const s = stateRef.current;
+
+    const handlePointerMove = (e: MouseEvent | TouchEvent) => {
+      const rect = container.getBoundingClientRect();
+      const halfW = s.tableWidth / 2;
+      const halfL = s.tableLength / 2;
+      const p1ClampW = halfW - s.p1MalletRadius - 0.2;
+      const p1ClampL = halfL - s.p1MalletRadius - 0.2;
+      const sens = propsRef.current.mouseSensitivityMultiplier || 2.5;
+
+      if ('touches' in e) {
+        for (let i = 0; i < e.touches.length; i++) {
+          const t = e.touches[i];
+          const clientX = t.clientX;
+          const clientY = t.clientY;
+          const normX = ((clientX - rect.left) / rect.width) * 2 - 1;
+          const normY = ((clientY - rect.top) / rect.height) * 2 - 1;
+
+          s.targetP1X = Math.max(-p1ClampW, Math.min(p1ClampW, normX * (halfW * sens)));
+          const mappedZ = 1.0 + Math.max(0, Math.min(1, (normY) * (sens * 0.5))) * (p1ClampL - 1.0);
+          s.targetP1Z = Math.max(0.6, Math.min(p1ClampL, mappedZ));
+        }
+      } else {
+        // Mouse event: direct 3D raycasting so mouse position aligns with the mallet
+        const clientX = e.clientX;
+        const clientY = e.clientY;
+        const normX = ((clientX - rect.left) / rect.width) * 2 - 1;
+        const normY = ((clientY - rect.top) / rect.height) * 2 - 1;
+
+        if (s.camera) {
+          const raycaster = new THREE.Raycaster();
+          raycaster.setFromCamera(new THREE.Vector2(normX, -normY), s.camera);
+          const tablePlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+          const intersect = new THREE.Vector3();
+          if (raycaster.ray.intersectPlane(tablePlane, intersect)) {
+            s.targetP1X = Math.max(-p1ClampW, Math.min(p1ClampW, intersect.x));
+            s.targetP1Z = Math.max(0.6, Math.min(p1ClampL, intersect.z));
+            return;
+          }
+        }
+
+        s.targetP1X = Math.max(-p1ClampW, Math.min(p1ClampW, normX * (halfW * sens)));
+        const mappedZ = 1.0 + Math.max(0, Math.min(1, (normY) * (sens * 0.5))) * (p1ClampL - 1.0);
+        s.targetP1Z = Math.max(0.6, Math.min(p1ClampL, mappedZ));
+      }
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') {
+        if (
+          !e.repeat &&
+          !s.p1PowerShotArmed &&
+          s.p1PowerShotCooldown <= 0
+        ) {
+          s.p1PowerShotArmed = true;
+          setIsPowerShotArmed(true);
+        }
+        return;
+      }
+      s.keys[e.key.toLowerCase()] = true;
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      s.keys[e.key.toLowerCase()] = false;
+    };
+
+    window.addEventListener('mousemove', handlePointerMove);
+    window.addEventListener('touchmove', handlePointerMove, { passive: true });
+    window.addEventListener('keydown', handleKeyDown);
+    window.addEventListener('keyup', handleKeyUp);
+
+    return () => {
+      window.removeEventListener('mousemove', handlePointerMove);
+      window.removeEventListener('touchmove', handlePointerMove);
+      window.removeEventListener('keydown', handleKeyDown);
+      window.removeEventListener('keyup', handleKeyUp);
+    };
+  }, []);
+
+  // Main 60FPS Physics & Render Loop
+  useEffect(() => {
+    const s = stateRef.current;
+
+    let lastTime = performance.now();
+
+    const loop = (time: number) => {
+      s.animId = requestAnimationFrame(loop);
+
+      const rawDt = (time - lastTime) / 1000;
+      const dt = Number.isFinite(rawDt) ? Math.max(0.001, Math.min(rawDt, 0.033)) : 0.016;
+      lastTime = time;
+
+      s.p1PowerShotCooldown = Math.max(0, s.p1PowerShotCooldown - dt);
+
+      const currentMode = propsRef.current.mode;
+      const currentDifficulty = propsRef.current.botDifficulty;
+      const speedRatio = propsRef.current.puckSpeedMultiplier / s.appliedPuckSpeedMultiplier;
+      if (speedRatio !== 1) {
+        s.puckVx *= speedRatio;
+        s.puckVz *= speedRatio;
+        s.appliedPuckSpeedMultiplier = propsRef.current.puckSpeedMultiplier;
+      }
+      const targetPuckRadius = currentMode === 'bot' ? 0.55 : 0.45;
+      if (s.puckRadius !== targetPuckRadius) {
+        s.puckRadius = targetPuckRadius;
+        s.puckMesh?.scale.setScalar(targetPuckRadius / 0.55);
+      }
+      if (
+        currentMode === 'online_host' &&
+        s.servePending &&
+        s.serveSide === 'p2' &&
+        s.requestedServeX !== null
+      ) {
+        servePuck('p2', s.requestedServeX);
+      }
+      if (
+        currentMode === 'bot' &&
+        s.servePending &&
+        s.serveSide === 'p2' &&
+        s.botServeReadyAt > 0 &&
+        time >= s.botServeReadyAt
+      ) {
+        servePuck('p2', 0);
+      }
+      if (
+        currentMode !== 'online_guest' &&
+        s.servePending &&
+        s.serveDeadline > 0 &&
+        time >= s.serveDeadline
+      ) {
+        servePuck(s.serveSide, s.requestedServeX ?? s.selectedServeX);
+      }
+      if (
+        currentMode === 'online_host' &&
+        time - s.lastRemotePaddleUpdateTime > 150
+      ) {
+        s.p2Vx = 0;
+        s.p2Vz = 0;
+      }
+      const halfW = s.tableWidth / 2;
+      const halfL = s.tableLength / 2;
+      const goalHalfW = s.goalWidth / 2;
+      const puckR = s.puckRadius;
+      const goalOpeningHalfWidth = goalHalfW - puckR;
+      const malletR1 = s.p1MalletRadius;
+      const malletR2 = currentMode === 'online_host' || currentMode === 'online_guest'
+        ? malletR1
+        : s.p2MalletRadius;
+
+      // 1. Update Player 1 position (Smooth lerp with velocity calculation)
+      // Keyboard support for Player 1:
+      const speed = 18 * dt;
+      if (s.keys['a'] || s.keys['arrowleft']) s.targetP1X -= speed;
+      if (s.keys['d'] || s.keys['arrowright']) s.targetP1X += speed;
+      if (s.keys['w'] || s.keys['arrowup']) s.targetP1Z -= speed;
+      if (s.keys['s'] || s.keys['arrowdown']) s.targetP1Z += speed;
+
+      // Clamp Player 1 to their half (Z > 0.6)
+      const p1ClampW = halfW - malletR1 - 0.2;
+      const p1ClampL = halfL - malletR1 - 0.2;
+      s.targetP1X = Math.max(-p1ClampW, Math.min(p1ClampW, s.targetP1X));
+      s.targetP1Z = Math.max(0.6, Math.min(p1ClampL, s.targetP1Z));
+
+      s.p1PrevX = s.p1X;
+      s.p1PrevZ = s.p1Z;
+
+      // Direct responsive physics follow (snappy with zero sluggish lag)
+      [s.p1X, s.p1Z] = getMalletPosition(s.p1X, s.p1Z, s.targetP1X, s.targetP1Z, dt);
+
+      const calcP1Vx = (s.p1X - s.p1PrevX) / dt;
+      const calcP1Vz = (s.p1Z - s.p1PrevZ) / dt;
+      s.p1Vx = Number.isFinite(calcP1Vx) ? calcP1Vx : 0;
+      s.p1Vz = Number.isFinite(calcP1Vz) ? calcP1Vz : 0;
+
+      // 2. Update Player 2 / Opponent
+      if (currentMode === 'bot') {
+        const isGracePeriod = performance.now() < s.botGracePeriodUntil;
+        if (isGracePeriod) {
+          // Grace period after goal: Bot holds ready defensive position and DOES NOT strike puck!
+          const readyZ = -halfL + 3.4;
+          s.p2PrevX = s.p2X;
+          s.p2PrevZ = s.p2Z;
+          s.p2X += (0 - s.p2X) * Math.min(1, 14 * dt);
+          s.p2Z += (readyZ - s.p2Z) * Math.min(1, 14 * dt);
+          s.p2Vx = 0;
+          s.p2Vz = 0;
+        } else {
+          const botConfig: Record<BotDifficulty, { speed: number; strikeBoost: number; predictDepth: number; aimSkill: number }> = {
+            rookie: { speed: 6.5,  strikeBoost: 1.05, predictDepth: 0.30, aimSkill: 0.20 },
+            normal: { speed: 9.5,  strikeBoost: 1.18, predictDepth: 0.60, aimSkill: 0.40 },
+            pro:    { speed: 21,   strikeBoost: 1.85, predictDepth: 1.55, aimSkill: 0.88 },
+            god:    { speed: 39.5, strikeBoost: 2.75, predictDepth: 2.30, aimSkill: 1.00 }
+          };
+          const activeBot = botConfig[currentDifficulty] || botConfig.normal;
+
+          // For rookie and normal bots, defend further back from the net and leave wider openings
+          const baseDefendZ = currentDifficulty === 'rookie'
+            ? -halfL + 2.0
+            : currentDifficulty === 'normal'
+            ? -halfL + 2.2
+            : -halfL + 2.4;
+          let targetX = 0;
+          let targetZ = baseDefendZ;
+          let currentBotSpeed = activeBot.speed;
+
+          // Aim at open side of the player's net away from Player 1's mallet
+          const openSide = s.p1X > 0 ? -1 : 1;
+          const aimError = (1 - activeBot.aimSkill) * Math.sin(performance.now() * 0.002) * goalOpeningHalfWidth * 0.95;
+          const targetGoalX = (openSide * goalOpeningHalfWidth * 0.85 * activeBot.aimSkill) + aimError;
+
+          const isPuckBehindBot = s.puckZ < s.p2Z + 0.3;
+
+          // CASE 1: DANGER / PUCK BEHIND BOT (Zero Own-Goal Guard)
+          if (isPuckBehindBot && s.puckZ < 0) {
+            // Never back straight into the puck toward own net!
+            // Step laterally away to clear the puck's path, then sweep forward
+            const lateralOffset = s.puckX >= s.p2X ? -2.6 : 2.6;
+            targetX = Math.max(-p1ClampW, Math.min(p1ClampW, s.puckX + lateralOffset));
+            targetZ = Math.max(-halfL + 1.4, s.p2Z);
+            currentBotSpeed = activeBot.speed * (currentDifficulty === 'rookie' ? 1.05 : 1.25);
+          }
+          // CASE 2: PREDICTIVE INTERCEPTION ALGORITHM
+          else if (s.puckZ <= 0.5 || s.puckVz < -0.4) {
+            // Trajectory forward simulation with friction and rail bounces
+            let bestInterceptTime = 0;
+            let interceptStrikeX = s.puckX;
+            let interceptStrikeZ = baseDefendZ;
+            let foundIntercept = false;
+
+            const dtSim = 0.04;
+            const maxSteps = Math.min(45, Math.round(activeBot.predictDepth / dtSim));
+            const minRailX = -halfW + puckR + 0.3;
+            const maxRailX = halfW - puckR - 0.3;
+
+            let simX = s.puckX;
+            let simZ = s.puckZ;
+            let simVx = s.puckVx;
+            let simVz = s.puckVz;
+            const friction = propsRef.current.puckFriction || 0.08;
+
+            for (let step = 1; step <= maxSteps; step++) {
+              const t = step * dtSim;
+              simVx *= (1 - friction * dtSim);
+              simVz *= (1 - friction * dtSim);
+              simX += simVx * dtSim;
+              simZ += simVz * dtSim;
+
+              // Rail bounces
+              if (simX < minRailX) {
+                simX = minRailX;
+                simVx = Math.abs(simVx);
+              } else if (simX > maxRailX) {
+                simX = maxRailX;
+                simVx = -Math.abs(simVx);
+              }
+
+              // In bot's playable zone
+              if (simZ <= -0.8 && simZ >= -halfL + 1.8) {
+                // Direction from predicted puck point to target goal
+                const dxG = targetGoalX - simX;
+                const dzG = halfL - simZ;
+                const lenG = Math.hypot(dxG, dzG) || 1;
+                const ux = dxG / lenG;
+                const uz = dzG / lenG;
+
+                // Striking position directly behind puck along shot vector
+                const setupOffset = s.p2MalletRadius + puckR + 0.45;
+                const strikePosX = Math.max(-p1ClampW, Math.min(p1ClampW, simX - ux * setupOffset));
+                const strikePosZ = Math.max(-halfL + 1.4, Math.min(-0.8, simZ - uz * setupOffset));
+
+                const distToStrike = Math.hypot(strikePosX - s.p2X, strikePosZ - s.p2Z);
+                const botTravelTime = distToStrike / (activeBot.speed * 0.95);
+
+                // Reaction lag: rookie and normal take longer to react to the incoming trajectory
+                const reactionLag = (1 - activeBot.aimSkill) * 0.22;
+                if (botTravelTime <= t + 0.04 - reactionLag) {
+                  bestInterceptTime = t;
+                  interceptStrikeX = strikePosX;
+                  interceptStrikeZ = strikePosZ;
+                  foundIntercept = true;
+                  break;
+                }
+              }
+            }
+
+            // Current shot vector from puck toward player net
+            const curDxG = targetGoalX - s.puckX;
+            const curDzG = halfL - s.puckZ;
+            const curLenG = Math.hypot(curDxG, curDzG) || 1;
+            const curUx = curDxG / curLenG;
+            const curUz = curDzG / curLenG;
+
+            const distToPuck = Math.hypot(s.puckX - s.p2X, s.puckZ - s.p2Z);
+            const isBehindPuck = s.p2Z < s.puckZ;
+            const strikeReach = s.p2MalletRadius + puckR + 0.9;
+
+            // STRIKE TRIGGER: If bot is in position to strike, DRIVE FORWARD THROUGH THE PUCK!
+            const canStrikeNow = isBehindPuck && (
+              distToPuck < strikeReach ||
+              (foundIntercept && bestInterceptTime <= 0.1) ||
+              (s.puckZ < -1.0 && Math.abs(s.puckX - s.p2X) < 1.6 && s.puckZ - s.p2Z < 2.5)
+            );
+
+            if (canStrikeNow) {
+              // DRIVE THROUGH PUCK TOWARD THE GOAL!
+              targetX = Math.max(-p1ClampW, Math.min(p1ClampW, s.puckX + curUx * 2.8));
+              targetZ = Math.min(-0.6, s.puckZ + curUz * 2.8);
+              currentBotSpeed = activeBot.speed * activeBot.strikeBoost;
+            } else if (foundIntercept) {
+              // Move directly to the predicted interception position to strike the puck
+              targetX = interceptStrikeX;
+              targetZ = interceptStrikeZ;
+              currentBotSpeed = activeBot.speed;
+            } else {
+              // Setup behind the puck along the goal shot vector
+              const setupOffset = s.p2MalletRadius + puckR + 0.8;
+              targetX = Math.max(-p1ClampW, Math.min(p1ClampW, s.puckX - curUx * setupOffset));
+              targetZ = Math.max(-halfL + 1.4, Math.min(-1.0, s.puckZ - curUz * setupOffset));
+              currentBotSpeed = activeBot.speed;
+            }
+          }
+          // CASE 3: DEFENSE / PUCK ON PLAYER HALF
+          else {
+            // Poach loose slow pucks near centerline only for high skill bots (Pro, God)
+            if (s.puckZ < 2.5 && Math.hypot(s.puckVx, s.puckVz) < 4.0 && activeBot.aimSkill >= 0.8) {
+              targetX = Math.max(-p1ClampW, Math.min(p1ClampW, s.puckX));
+              targetZ = -0.65;
+              currentBotSpeed = activeBot.speed * activeBot.strikeBoost;
+            } else {
+              // Mirror puck horizontally to block direct shots, hold defense line
+              // Rookie and normal mirror with loose sluggish factor so players can shoot around them
+              const mirrorCoeff = currentDifficulty === 'rookie'
+                ? 0.35
+                : currentDifficulty === 'normal'
+                ? 0.52
+                : (0.45 + activeBot.aimSkill * 0.35);
+              targetX = Math.max(-p1ClampW * 0.75, Math.min(p1ClampW * 0.75, s.puckX * mirrorCoeff));
+              targetZ = baseDefendZ;
+            }
+          }
+
+          const stepX = (targetX - s.p2X);
+          const stepZ = (targetZ - s.p2Z);
+          const dist = Math.sqrt(stepX * stepX + stepZ * stepZ);
+          const maxStep = currentBotSpeed * dt;
+
+          s.p2PrevX = s.p2X;
+          s.p2PrevZ = s.p2Z;
+
+          if (dist > 0.01) {
+            s.p2X += (stepX / dist) * Math.min(dist, maxStep);
+            s.p2Z += (stepZ / dist) * Math.min(dist, maxStep);
+          }
+
+          // Clamp Bot to its half (Z <= -0.6)
+          s.p2X = Math.max(-p1ClampW, Math.min(p1ClampW, s.p2X));
+          s.p2Z = Math.max(-p1ClampL, Math.min(-0.6, s.p2Z));
+
+          const calcP2Vx = (s.p2X - s.p2PrevX) / dt;
+          const calcP2Vz = (s.p2Z - s.p2PrevZ) / dt;
+          s.p2Vx = Number.isFinite(calcP2Vx) ? calcP2Vx : 0;
+          s.p2Vz = Number.isFinite(calcP2Vz) ? calcP2Vz : 0;
+        }
+      }
+
+      // 3. Puck Physics Sub-stepping (Host authoritative or Single-player)
+      const isSimulatingPhysics = currentMode !== 'online_guest';
+
+      if (isSimulatingPhysics && !s.gameOver && !s.servePending) {
+        const maxSpd = 50 * propsRef.current.puckSpeedMultiplier;
+        const subSteps = Math.max(6, Math.min(16, Math.ceil(maxSpd * dt / (puckR * 0.5))));
+        const subDt = dt / subSteps;
+
+        for (let step = 0; step < subSteps; step++) {
+          // Friction / Air cushion: slide smoothly with very low drag
+          const drag = Math.exp(-propsRef.current.puckFriction * subDt);
+          s.puckVx *= drag;
+          s.puckVz *= drag;
+
+          // Integrate position
+          s.puckX += s.puckVx * subDt;
+          s.puckZ += s.puckVz * subDt;
+
+          // Paddle 1 Collision
+          const playerHit = resolvePuckMalletHit(
+            s.puckX,
+            s.puckZ,
+            s.puckVx,
+            s.puckVz,
+            s.p1X,
+            s.p1Z,
+            s.p1Vx,
+            s.p1Vz,
+            puckR,
+            malletR1,
+            s.p1PowerShotArmed,
+            propsRef.current.puckSpeedMultiplier
+          );
+
+          if (playerHit) {
+            s.puckX = playerHit.x;
+            s.puckZ = playerHit.z;
+            s.puckVx = playerHit.vx;
+            s.puckVz = playerHit.vz;
+
+            if (playerHit.hit) {
+              if (playerHit.powerShot) {
+                s.p1PowerShotArmed = false;
+                s.p1PowerShotCooldown = 3;
+                setIsPowerShotArmed(false);
+              }
+
+              s.consecutivePostBounces = 0;
+              s.puckStuckTime = 0;
+              const hitStrength = Math.hypot(s.puckVx, s.puckVz);
+              sound.playPaddleHit(Number.isFinite(hitStrength) ? Math.min(2, Math.max(0.1, hitStrength / 12)) : 1);
+              triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 14);
+              s.lastTouchedBy = 'player';
+            }
+          }
+
+          // Paddle 2 Collision (Bot / Opponent)
+          const opponentHit = resolvePuckMalletHit(
+            s.puckX,
+            s.puckZ,
+            s.puckVx,
+            s.puckVz,
+            s.p2X,
+            s.p2Z,
+            s.p2Vx,
+            s.p2Vz,
+            puckR,
+            malletR2,
+            currentMode === 'online_host' ? s.p2PowerShotArmed : false,
+            propsRef.current.puckSpeedMultiplier
+          );
+
+          if (opponentHit) {
+            s.puckX = opponentHit.x;
+            s.puckZ = opponentHit.z;
+            s.puckVx = opponentHit.vx;
+            s.puckVz = opponentHit.vz;
+
+            if (opponentHit.hit) {
+              if (currentMode === 'bot') {
+                // ZERO-OWN-GOAL GUARANTEE: Bot strikes ALWAYS propel puck forward (+Z toward player)
+                if (s.puckVz < 3.0) {
+                  s.puckVz = Math.max(10.0, Math.abs(s.puckVz) * 1.3);
+                }
+                if (s.puckZ < -halfL + 3.0 && Math.abs(s.puckX) < goalHalfW + 0.8) {
+                  s.puckVz = Math.max(13.0, Math.abs(s.puckVz));
+                  s.puckVx = (s.puckX >= 0 ? 1 : -1) * Math.max(6.0, Math.abs(s.puckVx));
+                }
+              }
+
+              if (opponentHit.powerShot && currentMode === 'online_host') {
+                s.p2PowerShotArmed = false;
+                sendPeerPacket(propsRef.current.gameDataChannel, { type: 'guest-power-shot-used' });
+              }
+
+              s.consecutivePostBounces = 0;
+              s.puckStuckTime = 0;
+              const hitStrength = Math.hypot(s.puckVx, s.puckVz);
+              sound.playPaddleHit(Number.isFinite(hitStrength) ? Math.min(2, Math.max(0.1, hitStrength / 12)) : 1);
+              triggerSparks(s.puckX, 0.2, s.puckZ, 0xff0066, 14);
+              s.lastTouchedBy = 'opponent';
+            }
+          }
+
+          // 1. Four Cylindrical Goal Posts:
+          // Top Goal: (-goalHalfW, -halfL) & (+goalHalfW, -halfL)
+          // Bottom Goal: (-goalHalfW, +halfL) & (+goalHalfW, +halfL)
+          const postRadius = 0.28;
+          const postMinDist = puckR + postRadius;
+          const posts = [
+            { x: -goalHalfW, z: -halfL },
+            { x:  goalHalfW, z: -halfL },
+            { x: -goalHalfW, z:  halfL },
+            { x:  goalHalfW, z:  halfL },
+          ];
+
+          for (const post of posts) {
+            const dx = s.puckX - post.x;
+            const dz = s.puckZ - post.z;
+            const dist = Math.hypot(dx, dz);
+
+            if (dist < postMinDist && dist > 0.0001) {
+              const nx = dx / dist;
+              const nz = dz / dist;
+
+              // Separate puck from post
+              s.puckX = post.x + nx * (postMinDist + 0.02);
+              s.puckZ = post.z + nz * (postMinDist + 0.02);
+
+              const now = performance.now();
+              if (now - s.lastPostBounceTime < 1500) {
+                s.consecutivePostBounces += 1;
+              } else {
+                s.consecutivePostBounces = 1;
+              }
+              s.lastPostBounceTime = now;
+
+              const inwardZ = post.z > 0 ? -1 : 1;
+              const awayX = post.x > 0 ? -1 : 1;
+
+              // IF BOUNCING BETWEEN POSTS (2 or more bounces within 1.5s):
+              // Eject with a powerful 45-degree DIAGONAL breakout into the rink!
+              if (s.consecutivePostBounces >= 2) {
+                const breakoutSpeed = Math.max(14, Math.hypot(s.puckVx, s.puckVz) * 1.35);
+                s.puckVx = awayX * 0.7071 * breakoutSpeed;
+                s.puckVz = inwardZ * 0.7071 * breakoutSpeed;
+                s.consecutivePostBounces = 0;
+                sound.playWallHit(1.4);
+                triggerSparks(s.puckX, 0.2, s.puckZ, 0xff0066, 14);
+              } else {
+                // First post bounce: reflect and guarantee strong inward diagonal Z velocity
+                const vNorm = s.puckVx * nx + s.puckVz * nz;
+                if (vNorm < 0) {
+                  const restitution = 0.92;
+                  s.puckVx -= (1 + restitution) * vNorm * nx;
+                  s.puckVz -= (1 + restitution) * vNorm * nz;
+
+                  // Never allow purely horizontal trajectory across the goal line
+                  if (inwardZ * s.puckVz < 4.5) {
+                    s.puckVz = inwardZ * Math.max(5.5, Math.abs(s.puckVx) * 0.85);
+                  }
+                  sound.playWallHit(Math.max(0.4, Math.abs(vNorm) / 10));
+                  triggerSparks(s.puckX, 0.2, s.puckZ, 0xff0066, 8);
+                }
+              }
+              break;
+            }
+          }
+
+          // 2. Four 45-degree Corner Deflectors (Puck NEVER wedges into 90-degree corners)
+          const cornerCut = 2.0;
+          const absX = Math.abs(s.puckX);
+          const absZ = Math.abs(s.puckZ);
+          const cornerDist = (halfW - absX) + (halfL - absZ);
+
+          if (cornerDist < cornerCut + puckR) {
+            const nx = -Math.sign(s.puckX) * 0.7071;
+            const nz = -Math.sign(s.puckZ) * 0.7071;
+            const separation = (cornerCut + puckR) - cornerDist;
+
+            s.puckX += nx * (separation * 0.7071 + 0.04);
+            s.puckZ += nz * (separation * 0.7071 + 0.04);
+
+            const currSpeed = Math.hypot(s.puckVx, s.puckVz);
+            const exitSpeed = Math.max(9.0, currSpeed * 1.2);
+
+            s.puckVx = nx * exitSpeed;
+            s.puckVz = nz * exitSpeed;
+            s.consecutivePostBounces = 0;
+            s.puckStuckTime = 0;
+            sound.playWallHit(0.9);
+            triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 10);
+          }
+
+          // 3. Straight Rail Collisions
+          // Left Wall
+          if (s.puckX - puckR < -halfW) {
+            s.puckX = -halfW + puckR;
+            s.puckVx = Math.abs(s.puckVx) * 0.95;
+            s.consecutivePostBounces = 0;
+            sound.playWallHit(Math.abs(s.puckVx) / 10);
+            triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 6);
+          }
+          // Right Wall
+          if (s.puckX + puckR > halfW) {
+            s.puckX = halfW - puckR;
+            s.puckVx = -Math.abs(s.puckVx) * 0.95;
+            s.consecutivePostBounces = 0;
+            sound.playWallHit(Math.abs(s.puckVx) / 10);
+            triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 6);
+          }
+
+          // Top Wall & Goal Alcove Pocket (Opponent Side / P2 Goal)
+          if (Math.abs(s.puckX) <= goalOpeningHalfWidth) {
+              if (s.puckZ + puckR <= -halfL && !s.isScoring) {
+                const ownGoal =
+                  (currentMode === 'online_host' || currentMode === 'bot') &&
+                  !propsRef.current.allowOwnGoals &&
+                  s.lastTouchedBy === 'opponent';
+                if (ownGoal) {
+                  s.puckZ = -halfL + puckR;
+                  s.puckVz = Math.max(3, Math.abs(s.puckVz) * 1.15);
+                  sound.playWallHit(1);
+                  triggerSparks(s.puckX, 0.2, s.puckZ, 0xff0066, 10);
+                  continue;
+                }
+                handleGoal('player');
+                break;
+              }
+          } else {
+              if (s.puckZ - puckR <= -halfL) {
+                s.puckZ = -halfL + puckR;
+                if (s.puckVz < 0) s.puckVz = Math.abs(s.puckVz) * 0.95;
+                sound.playWallHit(Math.abs(s.puckVz) / 10);
+                triggerSparks(s.puckX, 0.2, s.puckZ, 0xff0066, 6);
+              }
+          }
+
+          // Bottom Wall & Goal Alcove Pocket (Player 1 Side / P1 Goal)
+          if (Math.abs(s.puckX) <= goalOpeningHalfWidth) {
+              if (s.puckZ - puckR >= halfL && !s.isScoring) {
+                const ownGoal =
+                  (currentMode === 'online_host' || currentMode === 'bot') &&
+                  !propsRef.current.allowOwnGoals &&
+                  s.lastTouchedBy === 'player';
+                if (ownGoal) {
+                  s.puckZ = halfL - puckR;
+                  s.puckVz = -Math.max(3, Math.abs(s.puckVz) * 1.15);
+                  sound.playWallHit(1.0);
+                  triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 10);
+                } else {
+                  handleGoal('opponent');
+                  break;
+                }
+              }
+          } else {
+              if (s.puckZ + puckR >= halfL) {
+                s.puckZ = halfL - puckR;
+                if (s.puckVz > 0) s.puckVz = -Math.abs(s.puckVz) * 0.95;
+                sound.playWallHit(Math.abs(s.puckVz) / 10);
+                triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 6);
+              }
+          }
+
+          // Absolute bounds safety guard: ensure puck NEVER clips out of bounds
+          s.puckX = Math.max(-halfW + puckR, Math.min(halfW - puckR, s.puckX));
+          if (Math.abs(s.puckX) > goalOpeningHalfWidth) {
+            s.puckZ = Math.max(-halfL + puckR, Math.min(halfL - puckR, s.puckZ));
+          } else {
+            const maxGoalDepth = goalHalfW;
+            s.puckZ = Math.max(-halfL - maxGoalDepth + puckR, Math.min(halfL + maxGoalDepth - puckR, s.puckZ));
+          }
+
+          // High-velocity arcade speed cap
+          const currSpd = Math.hypot(s.puckVx, s.puckVz);
+          if (currSpd > maxSpd) {
+            s.puckVx = (s.puckVx / currSpd) * maxSpd;
+            s.puckVz = (s.puckVz / currSpd) * maxSpd;
+          }
+
+          // Active Anti-Stuck & Dead Puck Ejection
+          if (currSpd < 1.6 && !s.servePending && !s.gameOver && !s.isScoring) {
+            s.puckStuckTime += subDt;
+            if (s.puckStuckTime >= 0.28) {
+              const sideDist = halfW - Math.abs(s.puckX);
+              const endDist = halfL - Math.abs(s.puckZ);
+
+              if (sideDist < puckR + 0.6) {
+                // Stuck along side rail: shoot inward diagonally!
+                s.puckVx = -Math.sign(s.puckX) * 6.5;
+                s.puckVz = (s.puckZ > 0 ? -1 : 1) * 5.0;
+              } else if (endDist < puckR + 0.6) {
+                // Stuck along end rail: shoot inward diagonally!
+                s.puckVz = -Math.sign(s.puckZ) * 6.5;
+                s.puckVx = (s.puckX > 0 ? -1 : 1) * 5.0;
+              } else {
+                // Stuck in open rink: table air cushion impulse
+                s.puckVx = (Math.random() > 0.5 ? 1 : -1) * 5.0;
+                s.puckVz = (s.puckZ > 0 ? -1 : 1) * 6.0;
+              }
+              s.puckStuckTime = 0;
+              triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 6);
+            }
+          } else {
+            s.puckStuckTime = 0;
+          }
+        }
+      }
+
+      if (time - s.lastHitCueUpdate >= 100) {
+        s.lastHitCueUpdate = time;
+        const hitDx = s.puckX - s.p1X;
+        const hitDz = s.puckZ - s.p1Z;
+        const hitRange = s.puckRadius + s.p1MalletRadius + 0.65;
+        const puckInHitRange = !s.servePending &&
+          !s.gameOver &&
+          hitDx * hitDx + hitDz * hitDz <= hitRange * hitRange;
+        if (puckInHitRange !== s.puckInHitRange) {
+          s.puckInHitRange = puckInHitRange;
+          setIsPuckInHitRange(puckInHitRange);
+        }
+      }
+
+      // Predict local guest mallet hits while the host's authoritative puck update is in flight.
+      if (currentMode === 'online_guest' && !s.gameOver && !s.servePending) {
+        const dx = s.puckX - s.p1X;
+        const dz = s.puckZ - s.p1Z;
+        const distance = Math.sqrt(dx * dx + dz * dz);
+        const minDistance = puckR + malletR1;
+
+        if (distance > minDistance + 0.2) {
+          s.isGuestPredictingPaddleHit = false;
+        } else if (distance < minDistance && distance > 0.0001 && !s.isGuestPredictingPaddleHit) {
+          const nx = dx / distance;
+          const nz = dz / distance;
+          s.puckX = s.p1X + nx * minDistance;
+          s.puckZ = s.p1Z + nz * minDistance;
+
+          const relativeVx = s.puckVx - s.p1Vx;
+          const relativeVz = s.puckVz - s.p1Vz;
+          const normalVelocity = relativeVx * nx + relativeVz * nz;
+
+          if (normalVelocity < 0) {
+            const impulse = -(1 + 1.45) * normalVelocity * propsRef.current.puckSpeedMultiplier;
+            s.puckVx += nx * impulse + s.p1Vx * 0.7;
+            s.puckVz += nz * impulse + s.p1Vz * 0.7;
+
+            const exitSpeed = Math.sqrt(s.puckVx * s.puckVx + s.puckVz * s.puckVz);
+            if (exitSpeed < 12) {
+              const boost = 12 / Math.max(0.1, exitSpeed);
+              s.puckVx *= boost;
+              s.puckVz *= boost;
+            }
+
+            s.lastTouchedBy = 'player';
+            sound.playPaddleHit(Number.isFinite(exitSpeed) ? Math.min(2, Math.max(0.1, exitSpeed / 12)) : 1);
+            triggerSparks(s.puckX, 0.2, s.puckZ, 0x00e5ff, 14);
+          }
+          s.isGuestPredictingPaddleHit = true;
+        }
+      }
+
+      // 4. Goal Detection Handler
+      function handleGoal(scorer: 'player' | 'opponent') {
+        if (s.isScoring || s.gameOver) return;
+        s.isScoring = true;
+        s.consecutivePostBounces = 0;
+        s.puckStuckTime = 0;
+        s.botStrikeUntil = 0;
+
+        sound.playGoal();
+        if (scorer === 'player') {
+          confetti({
+            particleCount: 60,
+            spread: 60,
+            origin: { y: 0.2 },
+            colors: ['#00e5ff', '#0070f3', '#ffffff']
+          });
+        }
+
+        const newP1 = scorer === 'player' ? s.p1Score + 1 : s.p1Score;
+        const newP2 = scorer === 'opponent' ? s.p2Score + 1 : s.p2Score;
+        s.p1Score = newP1;
+        s.p2Score = newP2;
+        setPlayerScore(newP1);
+        setOpponentScore(newP2);
+
+        propsRef.current.onGoalScored?.(scorer, { player: newP1, opponent: newP2 });
+        propsRef.current.onScoreUpdate?.({ player: newP1, opponent: newP2 });
+
+        const nextServer = scorer === 'player' ? 'p2' : 'p1';
+        s.servePending = true;
+        s.serveDeadline = performance.now() + 2000;
+        s.selectedServeX = 0;
+        s.serveSide = nextServer;
+        s.requestedServeX = null;
+        s.puckX = 0;
+        s.puckZ = nextServer === 'p1' ? 4 : -4;
+        s.puckVx = 0;
+        s.puckVz = 0;
+        s.puckRailRecoveryTime = 0;
+        s.botGracePeriodUntil = performance.now() + 1800;
+        s.botServeReadyAt = currentMode === 'bot' && nextServer === 'p2'
+          ? performance.now() + 2000
+          : 0;
+        setIsServing(true);
+        setSelectedServeX(0);
+        announce(nextServer === 'p1' ? 'YOUR SERVE' : 'OPPONENT SERVE');
+
+        if (newP1 >= propsRef.current.winningScore || newP2 >= propsRef.current.winningScore) {
+          s.gameOver = true;
+          s.servePending = false;
+          setIsServing(false);
+          const matchWinner = newP1 >= propsRef.current.winningScore ? 'player' : 'opponent';
+          setWinner(matchWinner);
+          announce(matchWinner === 'player' ? 'VICTORY!' : 'GAME OVER');
+          propsRef.current.onGameOver?.(matchWinner, { player: newP1, opponent: newP2 });
+        } else {
+          setTimeout(() => {
+            s.isScoring = false;
+            announce('');
+          }, 1500);
+        }
+      }
+
+      // 5. Update 3D Meshes
+      if (s.puckMesh) {
+        s.puckMesh.position.x = s.puckX;
+        s.puckMesh.position.z = s.puckZ;
+        s.puckMesh.rotation.y += (s.puckVx + s.puckVz) * 0.1;
+      }
+      if (s.p1Mesh) {
+        s.p1Mesh.position.x = s.p1X;
+        s.p1Mesh.position.z = s.p1Z;
+        s.p1Mesh.scale.setScalar(s.p1MalletRadius / 1.4);
+      }
+      if (s.p2Mesh) {
+        s.p2Mesh.position.x = s.p2X;
+        s.p2Mesh.position.z = s.p2Z;
+        const onlineMalletScale = currentMode === 'online_host' || currentMode === 'online_guest'
+          ? malletR1 / s.p2MalletRadius
+          : 1;
+        s.p2Mesh.scale.setScalar(onlineMalletScale);
+      }
+
+      // 6. Update Spark Particles
+      for (let i = s.particles.length - 1; i >= 0; i--) {
+        const p = s.particles[i];
+        p.mesh.position.x += p.vx * dt;
+        p.mesh.position.y += p.vy * dt;
+        p.mesh.position.z += p.vz * dt;
+        p.vy -= 9.8 * dt; // Gravity
+        p.life -= dt;
+
+        if (p.life <= 0) {
+          s.scene?.remove(p.mesh);
+          p.mesh.geometry.dispose();
+          s.particles.splice(i, 1);
+        }
+      }
+
+      // 7. Dynamic Camera Update based on selected View
+      if (s.camera) {
+        const camMode = propsRef.current.cameraView;
+        if (camMode === 'top') {
+          // Fixed, static Top View that DOES NOT MOVE the screen at all!
+          // Adjusted height ensures both nets (z = -14.8 to +14.8) are completely visible
+          s.camera.up.set(0, 0, -1);
+          const container = containerRef.current;
+          const aspect = container ? (container.clientWidth / Math.max(1, container.clientHeight)) : 1.6;
+          const topH = aspect < 1.1 ? Math.max(34, 34 / aspect) : 34;
+          s.camera.position.set(0, topH, 0.001);
+          s.camera.lookAt(0, 0, 0);
+
+        } else if (camMode === 'fpv') {
+          s.camera.up.set(0, 1, 0);
+          // True First-Person View behind Player 1 mallet looking forward
+          const targetCamX = s.p1X * 0.45;
+          const targetCamY = 3.6;
+          const targetCamZ = s.p1Z + 4.8;
+
+          s.camera.position.x += (targetCamX - s.camera.position.x) * 0.15;
+          s.camera.position.y += (targetCamY - s.camera.position.y) * 0.15;
+          s.camera.position.z += (targetCamZ - s.camera.position.z) * 0.15;
+
+          // Look at center-forward table area with dynamic slight puck tracking
+          const lookAtX = s.puckX * 0.35;
+          const lookAtZ = s.p1Z - 9;
+          s.camera.lookAt(lookAtX, 0.6, lookAtZ);
+
+        } else if (camMode === 'action') {
+          s.camera.up.set(0, 1, 0);
+          // Action dynamic camera tracking the puck
+          s.camera.position.set(s.puckX * 0.25, 9.5, s.tableLength * 0.6);
+          s.camera.lookAt(s.puckX * 0.6, 0.2, s.puckZ * 0.6);
+        } else {
+          s.camera.up.set(0, 1, 0);
+          // Classic angled perspective
+          s.camera.position.set(0, 16, s.tableLength * 0.72);
+          s.camera.lookAt(0, 0, 0);
+        }
+      }
+
+      // Exchange only the latest inputs and authoritative puck state over WebRTC.
+      if (currentMode === 'online_host' && time - s.lastSyncTime > 30) {
+        s.lastSyncTime = time;
+        sendPeerPacket(propsRef.current.gameDataChannel, {
+          type: 'host-state',
+          puckX: s.puckX,
+          puckZ: s.puckZ,
+          puckVx: s.puckVx,
+          puckVz: s.puckVz,
+          hostPaddleX: s.p1X,
+          hostPaddleZ: s.p1Z,
+          hostScore: s.p1Score,
+          guestScore: s.p2Score,
+          gameOver: s.gameOver,
+          servePending: s.servePending,
+          serveSide: s.serveSide,
+          puckSpeedMultiplier: propsRef.current.puckSpeedMultiplier,
+          puckFriction: propsRef.current.puckFriction,
+          resetVotes: Number(s.hostResetRequested) + Number(s.guestResetRequested),
+          puckResetVersion: s.puckResetVersion
+        });
+      } else if (currentMode === 'online_guest' && time - s.lastSyncTime > 16) {
+        s.lastSyncTime = time;
+        sendPeerPacket(propsRef.current.gameDataChannel, {
+          type: 'guest-input',
+          x: s.p1X,
+          z: s.p1Z,
+          vx: s.p1Vx,
+          vz: s.p1Vz,
+          powerShotArmed: s.p1PowerShotArmed
+        });
+      }
+
+      // Render Three.js scene
+      if (s.renderer && s.scene && s.camera) {
+        s.renderer.render(s.scene, s.camera);
+      }
+    };
+
+    s.animId = requestAnimationFrame(loop);
+
+    return () => {
+      cancelAnimationFrame(s.animId);
+    };
+  }, [triggerSparks, servePuck, announce, completePuckReset]);
+
+  const localServeSide = mode === 'online_guest' ? 'p2' : mode === 'online_host' ? 'p1' : stateRef.current.serveSide;
+  const canChooseServe =
+    (mode === 'online_guest' && stateRef.current.serveSide === 'p2') ||
+    (mode === 'online_host' && stateRef.current.serveSide === 'p1') ||
+    (mode === 'bot' && stateRef.current.serveSide === 'p1');
+  const submitServe = (serveX = selectedServeX) => {
+    if (mode === 'online_guest') {
+      sendPeerPacket(gameDataChannel, { type: 'serve-request', x: serveX });
+      announce('SERVE REQUESTED');
+      return;
+    }
+    servePuck(localServeSide, serveX);
+  };
+  const pickRandomServe = () => {
+    const spots = [-3.5, 0, 3.5];
+    const randomServeX = spots[Math.floor(Math.random() * spots.length)];
+    stateRef.current.selectedServeX = randomServeX;
+    setSelectedServeX(randomServeX);
+    submitServe(randomServeX);
+  };
+  const chooseServe = (serveX: number) => {
+    stateRef.current.selectedServeX = serveX;
+    setSelectedServeX(serveX);
+  };
+  const requestPuckReset = () => {
+    const s = stateRef.current;
+    if (s.gameOver || s.servePending) return;
+
+    if (mode === 'online_guest') {
+      if (s.guestResetRequested) return;
+    if (!gameDataChannel || gameDataChannel.readyState !== 'open') {
+      setResetRequestStatus('Opponent connection unavailable');
+      return;
+    }
+    s.guestResetRequested = true;
+      setResetRequestStatus('Waiting for the opponent to agree');
+      sendPeerPacket(gameDataChannel, { type: 'puck-reset-request' });
+    } else if (mode === 'online_host') {
+      if (s.hostResetRequested) return;
+      s.hostResetRequested = true;
+      if (s.guestResetRequested) {
+        completePuckReset();
+      } else {
+        setResetRequestStatus('Waiting for the opponent to agree');
+      }
+    } else if (mode === 'bot') {
+      completePuckReset();
+    }
+  };
+  useEffect(() => {
+    stateRef.current.p1MalletRadius = mode === 'bot' && helpDisabled
+      ? stateRef.current.p2MalletRadius
+      : 1.4;
+  }, [mode, helpDisabled]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="relative w-full h-full select-none overflow-hidden bg-slate-950 cursor-crosshair"
+    >
+      <canvas ref={canvasRef} className="block w-full h-full" />
+
+      {!winner && !isServing && !stateRef.current.servePending && (
+        <div className="absolute top-3 left-3 z-20 max-w-[calc(100%-1.5rem)] rounded-md border border-slate-700 bg-slate-900/95 p-2 shadow-lg">
+          <button
+            onClick={requestPuckReset}
+            disabled={
+              (mode === 'online_host' && stateRef.current.hostResetRequested) ||
+              (mode === 'online_guest' && stateRef.current.guestResetRequested)
+            }
+            className="w-full rounded-md border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+          >
+            {mode === 'bot' ? 'Reset puck to center' : 'Agree to reset puck'}
+          </button>
+          {resetRequestStatus && (
+            <p className="mt-1 text-center text-xs text-slate-400">{resetRequestStatus}</p>
+          )}
+        </div>
+      )}
+
+      {isPuckInHitRange && (
+        <div className="absolute top-3 right-3 z-20 rounded-md border border-slate-600 bg-slate-900/95 px-3 py-1.5 text-xs font-medium text-slate-100">
+          Puck is close. You can hit it.
+        </div>
+      )}
+
+      {isServing && stateRef.current.servePending && !winner && (
+        <div className="fixed bottom-[max(1rem,env(safe-area-inset-bottom))] left-1/2 z-30 w-[calc(100vw-1rem)] max-w-xs -translate-x-1/2 pointer-events-none">
+          <div className="rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-center shadow-lg pointer-events-auto">
+            <p className="mb-2 text-xs font-medium text-slate-200">
+              {canChooseServe ? 'Choose serve position' : 'Waiting for opponent to serve'}
+            </p>
+            {canChooseServe ? (
+              <>
+                <div className="flex items-center justify-center gap-1.5">
+                  {[
+                    { x: -3.5, label: 'Left' },
+                    { x: 0, label: 'Center' },
+                    { x: 3.5, label: 'Right' }
+                  ].map(spot => (
+                    <button
+                      key={spot.label}
+                      onClick={() => chooseServe(spot.x)}
+                      className={`rounded-md border px-2.5 py-1.5 text-xs font-medium transition ${
+                        selectedServeX === spot.x
+                          ? 'border-slate-400 bg-slate-700 text-white'
+                          : 'border-slate-700 bg-slate-950 text-slate-300 hover:bg-slate-800'
+                      }`}
+                    >
+                      {spot.label}
+                    </button>
+                  ))}
+                </div>
+                <div className="mt-1.5 flex gap-1.5">
+                  <button
+                    onClick={() => submitServe()}
+                    className="flex-1 rounded-md border border-slate-500 bg-slate-700 px-3 py-1.5 text-xs font-medium text-white transition hover:bg-slate-600"
+                  >
+                    Serve
+                  </button>
+                  <button
+                    onClick={pickRandomServe}
+                    className="flex-1 rounded-md border border-slate-700 bg-slate-950 px-3 py-1.5 text-xs font-medium text-slate-300 transition hover:bg-slate-800"
+                  >
+                    Random Serve
+                  </button>
+                </div>
+              </>
+            ) : (
+              <p className="text-xs text-slate-400">The puck is held until the server chooses a spot.</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Game Over Screen */}
+      {winner && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center p-4 bg-black/80 backdrop-blur-md">
+          <div className="w-full max-w-md p-8 rounded-xl bg-slate-900 border border-slate-700 shadow-xl text-center">
+            <div className="inline-block px-3 py-1 mb-4 rounded-md text-xs font-medium bg-slate-800 text-slate-300">
+              Match Completed
+            </div>
+
+            <h2 className={`text-3xl font-bold mb-2 ${winner === 'player' ? 'text-cyan-300' : 'text-rose-300'}`}>
+              {winner === 'player' ? 'You won' : 'Opponent won'}
+            </h2>
+
+            <p className="text-sm text-slate-300 mb-6">
+              Final Score: <span className="font-mono font-bold text-cyan-400">{playerScore}</span> - <span className="font-mono font-bold text-rose-400">{opponentScore}</span>
+            </p>
+
+            <button
+              onClick={resetMatch}
+              className="w-full py-3 px-6 rounded-lg font-semibold text-sm bg-slate-700 hover:bg-slate-600 text-white transition"
+            >
+              Play Again
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Controls HUD Hint */}
+      <div className="absolute bottom-3 left-4 z-20 flex items-center gap-3 text-xs text-slate-400/80 font-mono">
+        <span className="hidden sm:inline px-2 py-1 rounded bg-slate-900/80 border border-slate-800 pointer-events-none">
+          Mouse / Touch / WASD: Move Mallet
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            const s = stateRef.current;
+            if (!s.p1PowerShotArmed && s.p1PowerShotCooldown <= 0) {
+              s.p1PowerShotArmed = true;
+              setIsPowerShotArmed(true);
+            }
+          }}
+          disabled={isPowerShotArmed}
+          className={`pointer-events-auto px-2.5 py-1 rounded border transition-colors select-none ${
+            isPowerShotArmed
+              ? 'bg-amber-500/20 text-amber-300 border-amber-500/60 font-semibold shadow-[0_0_12px_rgba(245,158,11,0.3)] animate-pulse'
+              : 'bg-slate-900/80 border-slate-800 text-slate-400/80 hover:bg-slate-800 hover:text-slate-200'
+          }`}
+        >
+          {isPowerShotArmed ? 'POWER SHOT ARMED — HIT THE PUCK' : 'SHIFT: POWER SHOT'}
+        </button>
+      </div>
+
+    </div>
+  );
+};
