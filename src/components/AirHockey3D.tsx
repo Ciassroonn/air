@@ -2165,16 +2165,16 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         }
       }
 
-      if (s.camera && s.puckMesh && cursorRef.current) {
+      if (s.camera && s.p1Mesh && cursorRef.current) {
         const container = containerRef.current;
         if (container) {
           s.camera.updateMatrixWorld();
-          const projectedPuck = s.puckMesh.position.clone().project(s.camera);
-          const cursorX = (projectedPuck.x * 0.5 + 0.5) * container.clientWidth;
-          const cursorY = (-projectedPuck.y * 0.5 + 0.5) * container.clientHeight;
+          const projectedMallet = s.p1Mesh.position.clone().project(s.camera);
+          const cursorX = (projectedMallet.x * 0.5 + 0.5) * container.clientWidth;
+          const cursorY = (-projectedMallet.y * 0.5 + 0.5) * container.clientHeight;
           cursorRef.current.style.transform = `translate(${cursorX}px, ${cursorY}px)`;
           cursorRef.current.style.display =
-            projectedPuck.z >= -1 && projectedPuck.z <= 1 ? '' : 'none';
+            projectedMallet.z >= -1 && projectedMallet.z <= 1 ? '' : 'none';
         }
       }
 
@@ -2409,7 +2409,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       {/* Controls HUD Hint */}
       <div className="absolute bottom-3 left-4 z-20 flex items-center gap-3 text-xs text-slate-400/80 font-mono">
         <span className="px-2 py-1 rounded bg-slate-900/80 border border-slate-800 pointer-events-none">
-          Fake cursor tracks puck
+          Fake cursor tracks mallet
         </span>
         <span className="hidden sm:inline px-2 py-1 rounded bg-slate-900/80 border border-slate-800 pointer-events-none">
           Click table to lock mouse · Esc to release
