@@ -212,7 +212,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     // Table dimensions
     tableWidth: 14,
     tableLength: 26,
-    goalWidth: 4.4,
+    goalWidth: 5.2,
     puckRadius: 0.55,
     p1MalletRadius: 1.4, // Bigger player mallet
     p2MalletRadius: 0.8, // Smaller bot / opponent mallet
@@ -724,7 +724,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     scene.add(spotLight);
 
     // Blue/Cyan side glow (Player side)
-    const p1PointLight = new THREE.PointLight(0x00e5ff, 2.2, 18);
+    const p1PointLight = new THREE.PointLight(0x2563eb, 2.2, 18);
     p1PointLight.position.set(0, 4, 10);
     scene.add(p1PointLight);
 
@@ -739,10 +739,12 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     const goalHalfW = s.goalWidth / 2;
     const halfTableLength = s.tableLength / 2;
 
-    // Player half (Z > 0): Sleek neon navy blue
+    // Player half (Z > 0): saturated blue
     const playerSurfaceGeo = new THREE.BoxGeometry(s.tableWidth, 0.3, halfTableLength);
     const playerSurfaceMat = new THREE.MeshStandardMaterial({
-      color: 0x0f1d35,
+      color: 0x082b7a,
+      emissive: 0x061744,
+      emissiveIntensity: 0.35,
       roughness: 0.22,
       metalness: 0.32,
       envMapIntensity: 0.8
@@ -752,7 +754,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     playerRinkMesh.receiveShadow = true;
     scene.add(playerRinkMesh);
 
-    // Bot half (Z < 0): Bold vibrant crimson RED
+    // Bot half (Z < 0): vibrant red
     const botSurfaceGeo = new THREE.BoxGeometry(s.tableWidth, 0.3, halfTableLength);
     const botSurfaceMat = new THREE.MeshStandardMaterial({
       color: 0x991b1b,
@@ -770,9 +772,9 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     const linesGroup = new THREE.Group();
     linesGroup.position.y = 0.01;
 
-    // Center dividing red line
+    // Center dividing line
     const centerLineGeo = new THREE.PlaneGeometry(s.tableWidth, 0.12);
-    const centerLineMat = new THREE.MeshBasicMaterial({ color: 0xff1744, side: THREE.DoubleSide });
+    const centerLineMat = new THREE.MeshBasicMaterial({ color: 0x809cff, side: THREE.DoubleSide });
     const centerLine = new THREE.Mesh(centerLineGeo, centerLineMat);
     centerLine.rotation.x = -Math.PI / 2;
     linesGroup.add(centerLine);
@@ -797,7 +799,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const faceoffRing = new THREE.Mesh(
         new THREE.RingGeometry(1.15, 1.22, 48),
         new THREE.MeshBasicMaterial({
-          color: isBotSide ? 0xff4d6d : 0x9bb8d6,
+          color: isBotSide ? 0xff4d6d : 0x4f83ff,
           transparent: true,
           opacity: 0.72,
           side: THREE.DoubleSide
@@ -810,7 +812,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const faceoffDot = new THREE.Mesh(
         new THREE.CircleGeometry(0.16, 24),
         new THREE.MeshBasicMaterial({
-          color: isBotSide ? 0xff0055 : 0xdbeafe,
+          color: isBotSide ? 0xff1744 : 0x2563eb,
           transparent: true,
           opacity: 0.85,
           side: THREE.DoubleSide
@@ -823,7 +825,7 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 
     // Player 1 Goal Crease arc
     const p1CreaseGeo = new THREE.RingGeometry(2.8, 2.92, 32, 1, 0, Math.PI);
-    const p1CreaseMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, side: THREE.DoubleSide });
+    const p1CreaseMat = new THREE.MeshBasicMaterial({ color: 0x2563eb, side: THREE.DoubleSide });
     const p1Crease = new THREE.Mesh(p1CreaseGeo, p1CreaseMat);
     p1Crease.rotation.x = -Math.PI / 2;
     p1Crease.rotation.z = Math.PI;
@@ -840,11 +842,13 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
 
     scene.add(linesGroup);
 
-    // Air Holes pattern texture / illusion: Subtle micro grid
-    const gridHelper = new THREE.GridHelper(s.tableWidth, 28, 0x00e5ff, 0x112233);
-    gridHelper.position.y = 0.005;
-    gridHelper.scale.z = s.tableLength / s.tableWidth;
-    scene.add(gridHelper);
+    // Air-hole grid uses each side's color without crossing the center line.
+    for (const isBotSide of [false, true]) {
+      const gridHelper = new THREE.GridHelper(s.tableWidth, 28, isBotSide ? 0xff1744 : 0x2563eb, 0x112233);
+      gridHelper.position.set(0, 0.005, isBotSide ? -halfL / 2 : halfL / 2);
+      gridHelper.scale.z = halfL / s.tableWidth;
+      scene.add(gridHelper);
+    }
 
     // Rails (Side and End Rails with Goal Cutouts)
     const railHeight = 0.8;
@@ -856,8 +860,8 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       metalness: 0.85
     });
 
-    const neonCyanMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff });
-    const neonPinkMat = new THREE.MeshBasicMaterial({ color: 0xff0066 });
+    const playerRailTrimMat = new THREE.MeshBasicMaterial({ color: 0x2563eb });
+    const botRailTrimMat = new THREE.MeshBasicMaterial({ color: 0xff1744 });
 
     // Left Rail
     const leftRailGeo = new THREE.BoxGeometry(railThickness, railHeight, s.tableLength);
@@ -868,10 +872,12 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     scene.add(leftRail);
 
     // Left Rail Neon Trim
-    const leftTrimGeo = new THREE.BoxGeometry(0.12, 0.12, s.tableLength);
-    const leftTrim = new THREE.Mesh(leftTrimGeo, neonCyanMat);
-    leftTrim.position.set(-halfW - 0.06, railHeight + 0.06, 0);
-    scene.add(leftTrim);
+    const sideTrimGeo = new THREE.BoxGeometry(0.12, 0.12, halfL);
+    for (const isBotSide of [false, true]) {
+      const trim = new THREE.Mesh(sideTrimGeo, isBotSide ? botRailTrimMat : playerRailTrimMat);
+      trim.position.set(-halfW - 0.06, railHeight + 0.06, isBotSide ? -halfL / 2 : halfL / 2);
+      scene.add(trim);
+    }
 
     // Right Rail
     const rightRailGeo = new THREE.BoxGeometry(railThickness, railHeight, s.tableLength);
@@ -882,15 +888,17 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
     scene.add(rightRail);
 
     // Right Rail Neon Trim
-    const rightTrim = new THREE.Mesh(leftTrimGeo, neonCyanMat);
-    rightTrim.position.set(halfW + 0.06, railHeight + 0.06, 0);
-    scene.add(rightTrim);
+    for (const isBotSide of [false, true]) {
+      const trim = new THREE.Mesh(sideTrimGeo, isBotSide ? botRailTrimMat : playerRailTrimMat);
+      trim.position.set(halfW + 0.06, railHeight + 0.06, isBotSide ? -halfL / 2 : halfL / 2);
+      scene.add(trim);
+    }
 
     // End Rails (with goal gap in middle)
     const endSegmentWidth = (s.tableWidth - s.goalWidth) / 2;
 
     const createEndRail = (zPos: number, isP1: boolean) => {
-      const trimMat = neonPinkMat;
+      const trimMat = isP1 ? playerRailTrimMat : botRailTrimMat;
 
       // Left segment
       const segLeftGeo = new THREE.BoxGeometry(endSegmentWidth, railHeight, railThickness);
@@ -939,8 +947,11 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       scene.add(pocketNet);
 
       // Solid red goal frame, with supports anchored just outside the goal mouth.
+      const goalColor = isP1 ? 0x2563eb : 0xc4123d;
       const goalFrameMaterial = new THREE.MeshStandardMaterial({
-        color: 0x8f1230,
+        color: isP1 ? 0x1744a0 : 0x8f1230,
+        emissive: isP1 ? 0x071b55 : 0x31000d,
+        emissiveIntensity: 0.35,
         roughness: 0.3,
         metalness: 0.35
       });
@@ -953,13 +964,13 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const frameZ = zPos;
 
       // Top of the goal: Radiant Neon Crossbar Header
-      const goalNeonColor = 0xc4123d;
-      const goalAccentNeon = 0xf43f64;
+      const goalNeonColor = goalColor;
+      const goalAccentNeon = isP1 ? 0x60a5fa : 0xf43f64;
       const crossbarNeonMat = new THREE.MeshStandardMaterial({
-        color: 0x741027,
+        color: isP1 ? 0x1744a0 : 0x741027,
         roughness: 0.34,
         metalness: 0.42,
-        emissive: 0x31000d,
+        emissive: isP1 ? 0x071b55 : 0x31000d,
         emissiveIntensity: 0.45
       });
       const crossbar = new THREE.Mesh(
@@ -1011,6 +1022,16 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
         framePost.castShadow = true;
         framePost.receiveShadow = true;
         scene.add(framePost);
+
+        const supportStartX = side * (goalHalfW + 0.15 + framePostWidth / 2);
+        const supportEndX = side * halfW;
+        const supportLength = Math.abs(supportEndX - supportStartX);
+        const support = new THREE.Mesh(
+          new THREE.BoxGeometry(supportLength, 0.1, 0.12),
+          trimMat
+        );
+        support.position.set((supportStartX + supportEndX) / 2, railHeight + 0.02, frameZ);
+        scene.add(support);
       }
 
       // Goal Sensor Neon Glow
@@ -1028,9 +1049,9 @@ export const AirHockey3D: React.FC<AirHockey3DProps> = ({
       const radius = isP1 ? s.p1MalletRadius : s.p2MalletRadius;
       const group = new THREE.Group();
 
-      const sideColor = isP1 ? 0x00d4ff : 0xff3f76;
+        const sideColor = isP1 ? 0x2563eb : 0xff3f76;
       const deckMat = new THREE.MeshStandardMaterial({
-        color: isP1 ? 0x164653 : 0x55233b,
+          color: isP1 ? 0x102f78 : 0x55233b,
         roughness: 0.28,
         metalness: 0.78
       });
