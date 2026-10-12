@@ -177,11 +177,11 @@ git push -u origin main`;
             </pre>
           </div>
 
-          {/* Step 4: Vite Base Path note */}
+          {/* Step 4: GitHub Pages path note */}
           <div className="p-3 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-start gap-2.5 text-slate-300 text-xs">
             <ExternalLink className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
             <div>
-              <span className="font-bold text-cyan-300">GitHub Pages Base Path Note:</span> If you are deploying to <code className="font-mono text-cyan-400">https://{githubUser}.github.io/{repoName}/</code>, ensure your <code className="font-mono text-cyan-400">vite.config.ts</code> includes <code className="font-mono text-cyan-400">base: '/{repoName}/'</code>.
+              <span className="font-bold text-cyan-300">GitHub Pages:</span> This project builds asset links relative to the deployed page, so it works at <code className="font-mono text-cyan-400">https://{githubUser}.github.io/{repoName}/</code> without a repository-specific base path.
             </div>
           </div>
 
